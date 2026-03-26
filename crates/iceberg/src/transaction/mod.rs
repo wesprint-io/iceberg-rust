@@ -57,6 +57,7 @@ mod append;
 mod snapshot;
 mod sort_order;
 mod update_location;
+mod update_metadata;
 mod update_properties;
 mod update_statistics;
 mod upgrade_format_version;
@@ -73,6 +74,7 @@ use crate::transaction::action::BoxedTransactionAction;
 use crate::transaction::append::FastAppendAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
+use crate::transaction::update_metadata::UpdateMetadataAction;
 use crate::transaction::update_properties::UpdatePropertiesAction;
 use crate::transaction::update_statistics::UpdateStatisticsAction;
 use crate::transaction::upgrade_format_version::UpgradeFormatVersionAction;
@@ -154,6 +156,11 @@ impl Transaction {
     /// Update the statistics of table
     pub fn update_statistics(&self) -> UpdateStatisticsAction {
         UpdateStatisticsAction::new()
+    }
+
+    /// Create a metadata update action for schema and partition-spec metadata changes.
+    pub fn update_metadata(&self) -> UpdateMetadataAction {
+        UpdateMetadataAction::new()
     }
 
     /// Commit transaction.
