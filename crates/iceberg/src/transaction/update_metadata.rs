@@ -24,12 +24,13 @@ use crate::table::Table;
 use crate::transaction::action::{ActionCommit, TransactionAction};
 use crate::{Error, ErrorKind, Result, TableRequirement, TableUpdate};
 
-/// A transaction action for checking and updating table schema and partition-spec metadata.
+/// A transaction action for checking and updating table metadata.
 ///
 /// This action exposes low-level metadata operations that map directly to
 /// [`TableRequirement::CurrentSchemaIdMatch`], [`TableRequirement::DefaultSpecIdMatch`],
-/// [`TableUpdate::AddSchema`], [`TableUpdate::SetCurrentSchema`], [`TableUpdate::AddSpec`], and
-/// [`TableUpdate::SetDefaultSpec`]. Updates are replayed in insertion order when a transaction is
+/// [`TableRequirement::RefSnapshotIdMatch`], [`TableUpdate::AddSchema`],
+/// [`TableUpdate::SetCurrentSchema`], [`TableUpdate::AddSpec`], [`TableUpdate::SetDefaultSpec`],
+/// and [`TableUpdate::RemoveSnapshots`]. Updates are replayed in insertion order when a transaction is
 /// retried against refreshed table metadata.
 #[derive(Debug, Default)]
 pub struct UpdateMetadataAction {
@@ -81,6 +82,19 @@ impl UpdateMetadataAction {
         self
     }
 
+    /// Adds a requirement that the named ref still points at `snapshot_id`.
+    pub fn check_ref_snapshot_id(
+        mut self,
+        ref_name: impl Into<String>,
+        snapshot_id: Option<i64>,
+    ) -> Self {
+        self.requirements.push(TableRequirement::RefSnapshotIdMatch {
+            r#ref: ref_name.into(),
+            snapshot_id,
+        });
+        self
+    }
+
     /// Adds a partition spec update to this action.
     ///
     /// The spec is bound eagerly to the table's current schema when the transaction is applied. If
@@ -97,6 +111,16 @@ impl UpdateMetadataAction {
         self.updates.push(TableUpdate::SetDefaultSpec { spec_id });
         self
     }
+
+    /// Removes snapshots from table metadata.
+    ///
+    /// Missing snapshot ids are ignored when the update is applied.
+    pub fn remove_snapshots(mut self, snapshot_ids: Vec<i64>) -> Self {
+        if !snapshot_ids.is_empty() {
+            self.updates.push(TableUpdate::RemoveSnapshots { snapshot_ids });
+        }
+        self
+    }
 }
 
 #[async_trait]
@@ -105,7 +129,7 @@ impl TransactionAction for UpdateMetadataAction {
         if self.updates.is_empty() && self.requirements.is_empty() {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
-                "At least one schema or partition-spec metadata check or update is required for UpdateMetadataAction",
+                "At least one metadata check or update is required for UpdateMetadataAction",
             ));
         }
 
