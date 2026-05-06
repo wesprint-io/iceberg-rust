@@ -334,6 +334,22 @@ impl FileScanTaskReader {
                     }
                     None => Some(predicate_filtered_row_groups),
                 };
+
+                // Bloom-filter pruning narrows the surviving row groups further
+                // by consulting parquet bloom filters for equality / IN
+                // predicates. Only loads bloom filters for columns the
+                // predicate actually targets.
+                if let Some(candidates) = selected_row_group_indices.clone() {
+                    selected_row_group_indices = Some(
+                        ArrowReader::prune_row_groups_with_bloom_filters(
+                            &predicate,
+                            &mut record_batch_stream_builder,
+                            &field_id_map,
+                            candidates,
+                        )
+                        .await?,
+                    );
+                }
             }
 
             if self.row_selection_enabled {
