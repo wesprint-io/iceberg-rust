@@ -52,6 +52,9 @@ use crate::delete_vector::DeleteVector;
 use crate::error::Result;
 use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
 use crate::expr::visitors::page_index_evaluator::PageIndexEvaluator;
+use crate::expr::visitors::row_group_bloom_filter_evaluator::{
+    RowGroupBloomFilterEvaluator, RowGroupBloomFilters, collect_bloom_filterable_column_indices,
+};
 use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator;
 use crate::expr::{BoundPredicate, BoundReference};
 use crate::io::{FileIO, FileMetadata, FileRead};
@@ -519,6 +522,22 @@ impl ArrowReader {
                     }
                     None => Some(predicate_filtered_row_groups),
                 };
+
+                // Bloom-filter pruning narrows the surviving row groups further
+                // by consulting parquet bloom filters for equality / IN
+                // predicates. Only loads bloom filters for columns the
+                // predicate actually targets.
+                if let Some(candidates) = selected_row_group_indices.clone() {
+                    selected_row_group_indices = Some(
+                        Self::prune_row_groups_with_bloom_filters(
+                            &predicate,
+                            &mut record_batch_stream_builder,
+                            &field_id_map,
+                            candidates,
+                        )
+                        .await?,
+                    );
+                }
             }
 
             if row_selection_enabled {
@@ -981,6 +1000,73 @@ impl ArrowReader {
         }
 
         Ok(results)
+    }
+
+    /// Narrows `candidate_row_groups` by consulting parquet bloom filters for
+    /// the equality / IN predicates the scan filter contains. Bloom filters
+    /// are loaded on demand for each surviving (row_group, column) pair; row
+    /// groups whose bloom filter proves the predicate false are dropped.
+    /// Row groups for which no relevant bloom filter is present pass through
+    /// unchanged.
+    async fn prune_row_groups_with_bloom_filters<R>(
+        predicate: &BoundPredicate,
+        builder: &mut ParquetRecordBatchStreamBuilder<R>,
+        field_id_map: &HashMap<i32, usize>,
+        candidate_row_groups: Vec<usize>,
+    ) -> Result<Vec<usize>>
+    where
+        R: AsyncFileReader + Send + 'static,
+    {
+        let bloom_filterable_columns =
+            collect_bloom_filterable_column_indices(predicate, field_id_map)?;
+        if bloom_filterable_columns.is_empty() {
+            return Ok(candidate_row_groups);
+        }
+
+        // Cache the column descriptors before mutably borrowing the builder
+        // for bloom filter loads.
+        let parquet_columns = builder.parquet_schema().columns().to_vec();
+
+        let mut survivors = Vec::with_capacity(candidate_row_groups.len());
+        for row_group_idx in candidate_row_groups {
+            let mut bloom_filters = RowGroupBloomFilters::default();
+            for column_idx in &bloom_filterable_columns {
+                let sbbf = builder
+                    .get_row_group_column_bloom_filter(row_group_idx, *column_idx)
+                    .await
+                    .map_err(|source| {
+                        Error::new(
+                            ErrorKind::Unexpected,
+                            format!(
+                                "Failed to load bloom filter for row group {row_group_idx} column {column_idx}"
+                            ),
+                        )
+                        .with_source(source)
+                    })?;
+                if let Some(sbbf) = sbbf {
+                    bloom_filters.insert(*column_idx, sbbf);
+                }
+            }
+
+            // No bloom filters were available for the columns we care about
+            // in this row group — keep it.
+            if bloom_filters.is_empty() {
+                survivors.push(row_group_idx);
+                continue;
+            }
+
+            let might_match = RowGroupBloomFilterEvaluator::eval(
+                predicate,
+                &bloom_filters,
+                field_id_map,
+                &parquet_columns,
+            )?;
+            if might_match {
+                survivors.push(row_group_idx);
+            }
+        }
+
+        Ok(survivors)
     }
 
     fn get_row_selection_for_filter_predicate(
@@ -2354,6 +2440,179 @@ message schema {
             .downcast_ref::<Int32Array>()
             .expect("id is int32");
         assert_eq!(id_values.values(), &[2_i32], "expected the row with value=20");
+    }
+
+    /// End-to-end check that parquet bloom filter pruning is consulted during
+    /// row-group selection. The file's bloom filter is the only thing that can
+    /// rule out the predicate value: min/max statistics span `[1, 100]` and so
+    /// cannot disprove `col = 50`, but the bloom filter knows only `1` and
+    /// `100` were inserted. Without bloom-filter pushdown, the row group is
+    /// scanned and the row filter rejects every row; *with* it, the row group
+    /// is dropped before any data pages are read. Either way we must observe
+    /// zero output rows.
+    #[tokio::test]
+    async fn test_bloom_filter_prunes_row_group_when_value_definitely_absent() {
+        use parquet::file::properties::WriterProperties;
+        use parquet::schema::types::ColumnPath;
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+
+        // Two values whose [min, max] = [1, 100] *contains* the predicate
+        // literal we'll search for, so min/max pruning cannot reject the row
+        // group. Only the bloom filter has the information that 50 was never
+        // inserted.
+        let id_data = Arc::new(arrow_array::Int32Array::from(vec![1_i32, 100])) as ArrayRef;
+        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![id_data]).unwrap();
+
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().to_str().unwrap().to_string();
+        let file_io = FileIO::new_with_fs();
+
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .set_column_bloom_filter_enabled(ColumnPath::from("id"), true)
+            .set_column_bloom_filter_ndv(ColumnPath::from("id"), 8)
+            .set_column_bloom_filter_fpp(ColumnPath::from("id"), 0.01)
+            .build();
+        let file = File::create(format!("{table_location}/1.parquet")).unwrap();
+        let mut writer = ArrowWriter::try_new(file, to_write.schema(), Some(props)).unwrap();
+        writer.write(&to_write).expect("Writing batch");
+        writer.close().unwrap();
+
+        let predicate = Reference::new("id").equal_to(Datum::int(50));
+        let tasks = Box::pin(futures::stream::iter(
+            vec![Ok(FileScanTask {
+                file_size_in_bytes: std::fs::metadata(format!("{table_location}/1.parquet"))
+                    .unwrap()
+                    .len(),
+                start: 0,
+                length: 0,
+                record_count: None,
+                data_file_path: format!("{table_location}/1.parquet"),
+                data_file_format: DataFileFormat::Parquet,
+                schema: schema.clone(),
+                project_field_ids: vec![1],
+                predicate: Some(predicate.bind(schema.clone(), true).unwrap()),
+                deletes: vec![],
+                partition: None,
+                partition_spec: None,
+                name_mapping: None,
+                case_sensitive: true,
+            })]
+            .into_iter(),
+        )) as FileScanTaskStream;
+
+        let reader = ArrowReaderBuilder::new(file_io).build();
+        let result = reader
+            .read(tasks)
+            .unwrap()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+
+        let total_rows: usize = result.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            total_rows, 0,
+            "bloom filter should prove `id = 50` is absent and produce zero rows"
+        );
+    }
+
+    /// Companion to the pruning test above: a predicate value that *is*
+    /// present in the bloom filter must not be pruned (bloom filters never
+    /// produce false negatives), and the row should be returned through the
+    /// regular row-filter path.
+    #[tokio::test]
+    async fn test_bloom_filter_keeps_row_group_when_value_is_present() {
+        use parquet::file::properties::WriterProperties;
+        use parquet::schema::types::ColumnPath;
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+
+        let id_data = Arc::new(arrow_array::Int32Array::from(vec![1_i32, 100])) as ArrayRef;
+        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![id_data]).unwrap();
+
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().to_str().unwrap().to_string();
+        let file_io = FileIO::new_with_fs();
+
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .set_column_bloom_filter_enabled(ColumnPath::from("id"), true)
+            .set_column_bloom_filter_ndv(ColumnPath::from("id"), 8)
+            .set_column_bloom_filter_fpp(ColumnPath::from("id"), 0.01)
+            .build();
+        let file = File::create(format!("{table_location}/1.parquet")).unwrap();
+        let mut writer = ArrowWriter::try_new(file, to_write.schema(), Some(props)).unwrap();
+        writer.write(&to_write).expect("Writing batch");
+        writer.close().unwrap();
+
+        let predicate = Reference::new("id").equal_to(Datum::int(1));
+        let tasks = Box::pin(futures::stream::iter(
+            vec![Ok(FileScanTask {
+                file_size_in_bytes: std::fs::metadata(format!("{table_location}/1.parquet"))
+                    .unwrap()
+                    .len(),
+                start: 0,
+                length: 0,
+                record_count: None,
+                data_file_path: format!("{table_location}/1.parquet"),
+                data_file_format: DataFileFormat::Parquet,
+                schema: schema.clone(),
+                project_field_ids: vec![1],
+                predicate: Some(predicate.bind(schema.clone(), true).unwrap()),
+                deletes: vec![],
+                partition: None,
+                partition_spec: None,
+                name_mapping: None,
+                case_sensitive: true,
+            })]
+            .into_iter(),
+        )) as FileScanTaskStream;
+
+        let reader = ArrowReaderBuilder::new(file_io).build();
+        let result = reader
+            .read(tasks)
+            .unwrap()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+
+        let total_rows: usize = result.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 1, "value 1 is present, must not be pruned");
+        let id_column = result[0].column_by_name("id").expect("id column present");
+        let id_values = id_column
+            .as_any()
+            .downcast_ref::<arrow_array::Int32Array>()
+            .expect("id is int32");
+        assert_eq!(id_values.values(), &[1_i32]);
     }
 
     #[tokio::test]
