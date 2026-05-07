@@ -23,7 +23,9 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use arrow_schema::{Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
+use arrow_schema::{
+    DataType, Field, Fields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
+};
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ProjectionMask};
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 
@@ -376,41 +378,74 @@ pub(super) fn apply_name_mapping_to_arrow_schema(
         "Schema already has field IDs - name mapping should not be applied"
     );
 
+    let top_level_mapped: Vec<Arc<crate::spec::MappedField>> = name_mapping
+        .fields()
+        .iter()
+        .cloned()
+        .map(Arc::new)
+        .collect();
+
     let fields_with_mapped_ids: Vec<_> = arrow_schema
         .fields()
         .iter()
-        .map(|field| {
-            // Look up this column name in name mapping to get the Iceberg field ID.
-            // Corresponds to Java's ApplyNameMapping visitor which calls
-            // nameMapping.find(currentPath()) and returns field.withId() if found.
-            //
-            // If the field isn't in the mapping, leave it WITHOUT assigning an ID
-            // (matching Java's behavior of returning the field unchanged).
-            // Later, during projection, fields without IDs are filtered out.
-            let mapped_field_opt = name_mapping
-                .fields()
-                .iter()
-                .find(|f| f.names().contains(&field.name().to_string()));
-
-            let mut metadata = field.metadata().clone();
-
-            if let Some(mapped_field) = mapped_field_opt
-                && let Some(field_id) = mapped_field.field_id()
-            {
-                // Field found in mapping with a field_id → assign it
-                metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string());
-            }
-            // If field_id is None, leave the field without an ID (will be filtered by projection)
-
-            Field::new(field.name(), field.data_type().clone(), field.is_nullable())
-                .with_metadata(metadata)
-        })
+        .map(|field| apply_name_mapping_to_arrow_field(field, &top_level_mapped))
         .collect();
 
     Ok(Arc::new(ArrowSchema::new_with_metadata(
         fields_with_mapped_ids,
         arrow_schema.metadata().clone(),
     )))
+}
+
+/// Recursively assigns iceberg field ids to one arrow field by looking up its
+/// name in `candidates` (the [`crate::spec::MappedField`]s available at this
+/// level of the schema). For struct/list/map types, recurses into the children
+/// using the matched mapping's nested fields, mirroring iceberg-java's
+/// `ApplyNameMapping` visitor.
+fn apply_name_mapping_to_arrow_field(
+    field: &arrow_schema::FieldRef,
+    candidates: &[Arc<crate::spec::MappedField>],
+) -> arrow_schema::FieldRef {
+    let mapped_field = candidates
+        .iter()
+        .find(|m| m.names().iter().any(|n| n == field.name()));
+
+    let mut metadata = field.metadata().clone();
+    if let Some(mapped) = mapped_field
+        && let Some(field_id) = mapped.field_id()
+    {
+        metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string());
+    }
+
+    let nested_candidates: &[Arc<crate::spec::MappedField>] = mapped_field
+        .map(|m| m.fields())
+        .unwrap_or_default();
+
+    let new_data_type = match field.data_type() {
+        DataType::Struct(children) => {
+            let new_children: Vec<arrow_schema::FieldRef> = children
+                .iter()
+                .map(|child| apply_name_mapping_to_arrow_field(child, nested_candidates))
+                .collect();
+            DataType::Struct(Fields::from(new_children))
+        }
+        DataType::List(element) => {
+            DataType::List(apply_name_mapping_to_arrow_field(element, nested_candidates))
+        }
+        DataType::LargeList(element) => {
+            DataType::LargeList(apply_name_mapping_to_arrow_field(element, nested_candidates))
+        }
+        DataType::Map(struct_field, sorted) => DataType::Map(
+            apply_name_mapping_to_arrow_field(struct_field, nested_candidates),
+            *sorted,
+        ),
+        other => other.clone(),
+    };
+
+    Arc::new(
+        Field::new(field.name(), new_data_type, field.is_nullable())
+            .with_metadata(metadata),
+    )
 }
 
 /// Add position-based fallback field IDs to Arrow schema for Parquet files lacking them.
