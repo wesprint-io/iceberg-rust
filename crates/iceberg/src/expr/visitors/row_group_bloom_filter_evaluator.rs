@@ -89,10 +89,34 @@ impl<'a> RowGroupBloomFilterEvaluator<'a> {
 
     fn datum_might_be_in(&self, sbbf: &Sbbf, column_descr: &ColumnDescriptor, datum: &Datum) -> bool {
         match datum_to_bloom_filter_bytes(datum, column_descr) {
-            Some(bytes) => sbbf.check(bytes.as_slice()),
+            Some(bytes) => {
+                let result = sbbf.check(bytes.as_slice());
+                if !result && std::env::var("ICEBERG_BLOOM_DEBUG").is_ok() {
+                    eprintln!(
+                        "[iceberg::bloom] CHECK_FALSE column={:?} parquet_path={:?} physical={:?} type_length={} datum={:?} bytes_hex={}",
+                        column_descr.name(),
+                        column_descr.path(),
+                        column_descr.physical_type(),
+                        column_descr.type_length(),
+                        datum,
+                        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                    );
+                }
+                result
+            }
             // Unsupported encoding: be conservative and assume the value
             // *may* be present.
-            None => true,
+            None => {
+                if std::env::var("ICEBERG_BLOOM_DEBUG").is_ok() {
+                    eprintln!(
+                        "[iceberg::bloom] ENCODING_UNSUPPORTED column={:?} physical={:?} datum={:?}; treating as MIGHT_MATCH",
+                        column_descr.name(),
+                        column_descr.physical_type(),
+                        datum,
+                    );
+                }
+                true
+            }
         }
     }
 }

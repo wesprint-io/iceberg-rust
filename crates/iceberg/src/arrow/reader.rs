@@ -1027,6 +1027,11 @@ impl ArrowReader {
         // for bloom filter loads.
         let parquet_columns = builder.parquet_schema().columns().to_vec();
 
+        let debug = std::env::var("ICEBERG_BLOOM_DEBUG").is_ok();
+        let input_len = candidate_row_groups.len();
+        let mut row_groups_with_loaded_filter = 0_usize;
+        let mut row_groups_pruned = 0_usize;
+
         let mut survivors = Vec::with_capacity(candidate_row_groups.len());
         for row_group_idx in candidate_row_groups {
             let mut bloom_filters = RowGroupBloomFilters::default();
@@ -1054,6 +1059,7 @@ impl ArrowReader {
                 survivors.push(row_group_idx);
                 continue;
             }
+            row_groups_with_loaded_filter += 1;
 
             let might_match = RowGroupBloomFilterEvaluator::eval(
                 predicate,
@@ -1063,7 +1069,16 @@ impl ArrowReader {
             )?;
             if might_match {
                 survivors.push(row_group_idx);
+            } else {
+                row_groups_pruned += 1;
             }
+        }
+
+        if debug {
+            eprintln!(
+                "[iceberg::bloom] prune_row_groups_with_bloom_filters: input={input_len} loaded_filters={row_groups_with_loaded_filter} pruned={row_groups_pruned} survivors={}",
+                survivors.len(),
+            );
         }
 
         Ok(survivors)
