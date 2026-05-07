@@ -536,9 +536,25 @@ message schema {
 
         let predicate = Reference::new("nested.value").equal_to(Datum::long(42));
         let bound_predicate = predicate.bind(schema.clone(), true).unwrap();
-        let (iceberg_field_ids, field_id_map) =
-            ArrowReader::build_field_id_set_and_map(&parquet_schema, &bound_predicate)
-                .expect("build field id map");
+        let arrow_schema_for_test = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "nested",
+                DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+                    "value",
+                    DataType::Int64,
+                    false,
+                )])),
+                false,
+            ),
+        ]));
+
+        let (iceberg_field_ids, field_id_map) = ArrowReader::build_field_id_set_and_map(
+            &parquet_schema,
+            &arrow_schema_for_test,
+            &bound_predicate,
+        )
+        .expect("build field id map");
 
         ArrowReader::get_row_filter(
             &bound_predicate,

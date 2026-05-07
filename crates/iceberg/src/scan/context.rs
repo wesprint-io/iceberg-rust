@@ -28,8 +28,8 @@ use crate::scan::{
     PartitionFilterCache,
 };
 use crate::spec::{
-    ManifestContentType, ManifestEntryRef, ManifestFile, ManifestList, SchemaRef, SnapshotRef,
-    TableMetadataRef,
+    ManifestContentType, ManifestEntryRef, ManifestFile, ManifestList, NameMapping, SchemaRef,
+    SnapshotRef, TableMetadataRef,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -47,6 +47,7 @@ pub(crate) struct ManifestFileContext {
     expression_evaluator_cache: Arc<ExpressionEvaluatorCache>,
     delete_file_index: DeleteFileIndex,
     case_sensitive: bool,
+    name_mapping: Option<Arc<NameMapping>>,
 }
 
 /// Wraps a [`ManifestEntryRef`] alongside the objects that are needed
@@ -61,6 +62,7 @@ pub(crate) struct ManifestEntryContext {
     pub snapshot_schema: SchemaRef,
     pub delete_file_index: DeleteFileIndex,
     pub case_sensitive: bool,
+    pub name_mapping: Option<Arc<NameMapping>>,
 }
 
 impl ManifestFileContext {
@@ -76,7 +78,8 @@ impl ManifestFileContext {
             mut sender,
             expression_evaluator_cache,
             delete_file_index,
-            ..
+            case_sensitive,
+            name_mapping,
         } = self;
 
         let manifest = object_cache.get_manifest(&manifest_file).await?;
@@ -91,7 +94,8 @@ impl ManifestFileContext {
                 bound_predicates: bound_predicates.clone(),
                 snapshot_schema: snapshot_schema.clone(),
                 delete_file_index: delete_file_index.clone(),
-                case_sensitive: self.case_sensitive,
+                case_sensitive,
+                name_mapping: name_mapping.clone(),
             };
 
             sender
@@ -137,8 +141,7 @@ impl ManifestEntryContext {
             partition: Some(self.manifest_entry.data_file.partition.clone()),
             // TODO: Pass actual PartitionSpec through context chain for native flow
             partition_spec: None,
-            // TODO: Extract name_mapping from table metadata property "schema.name-mapping.default"
-            name_mapping: None,
+            name_mapping: self.name_mapping,
             case_sensitive: self.case_sensitive,
         })
     }
@@ -161,6 +164,13 @@ pub(crate) struct PlanContext {
     pub partition_filter_cache: Arc<PartitionFilterCache>,
     pub manifest_evaluator_cache: Arc<ManifestEvaluatorCache>,
     pub expression_evaluator_cache: Arc<ExpressionEvaluatorCache>,
+
+    /// Name mapping parsed from the `schema.name-mapping.default` table
+    /// property when present. Threaded into every [`FileScanTask`] so the
+    /// reader can derive iceberg field IDs for parquet files written without
+    /// embedded field-id metadata (e.g., Hive/Spark migrations, or any
+    /// arrow-rs writer that doesn't propagate field ids on nested leaves).
+    pub name_mapping: Option<Arc<NameMapping>>,
 }
 
 impl PlanContext {
@@ -283,6 +293,7 @@ impl PlanContext {
             expression_evaluator_cache: self.expression_evaluator_cache.clone(),
             delete_file_index,
             case_sensitive: self.case_sensitive,
+            name_mapping: self.name_mapping.clone(),
         }
     }
 }

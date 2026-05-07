@@ -280,6 +280,19 @@ impl<'a> TableScanBuilder<'a> {
             None
         };
 
+        // Per Iceberg spec, parquet files written without embedded field IDs
+        // (e.g., Hive/Spark migrations or arrow-rs writers that don't tag
+        // every leaf) must be projected via the table's
+        // `schema.name-mapping.default` property. Surface that mapping here
+        // so it reaches every `FileScanTask`.
+        let name_mapping = self
+            .table
+            .metadata()
+            .properties()
+            .get(crate::spec::DEFAULT_SCHEMA_NAME_MAPPING)
+            .and_then(|json| serde_json::from_str::<crate::spec::NameMapping>(json).ok())
+            .map(Arc::new);
+
         let plan_context = PlanContext {
             snapshot,
             table_metadata: self.table.metadata_ref(),
@@ -292,6 +305,7 @@ impl<'a> TableScanBuilder<'a> {
             partition_filter_cache: Arc::new(PartitionFilterCache::new()),
             manifest_evaluator_cache: Arc::new(ManifestEvaluatorCache::new()),
             expression_evaluator_cache: Arc::new(ExpressionEvaluatorCache::new()),
+            name_mapping,
         };
 
         Ok(TableScan {

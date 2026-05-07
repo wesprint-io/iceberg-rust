@@ -38,6 +38,7 @@ use crate::{Error, ErrorKind};
 impl ArrowReader {
     pub(super) fn build_field_id_set_and_map(
         parquet_schema: &SchemaDescriptor,
+        arrow_schema: &ArrowSchemaRef,
         predicate: &BoundPredicate,
     ) -> Result<(HashSet<i32>, HashMap<i32, usize>)> {
         // Collects all Iceberg field IDs referenced in the filter predicate
@@ -48,10 +49,25 @@ impl ArrowReader {
 
         let iceberg_field_ids = collector.field_ids();
 
-        // Without embedded field IDs, we fall back to position-based mapping for compatibility
+        // Field-id map source priority:
+        //   1. parquet schema's embedded field-ids (when the writer tagged
+        //      every leaf; covers files written natively by iceberg-rust).
+        //   2. arrow schema's `PARQUET:field_id` leaf metadata. The reader
+        //      populates this from `schema.name-mapping.default` (when set
+        //      on the table) before this point, so files written without
+        //      embedded ids still resolve correctly.
+        //   3. position-based fallback. Only correct when the iceberg schema's
+        //      field ids exactly match the fallback assignment.
         let field_id_map = match build_field_id_map(parquet_schema)? {
             Some(map) => map,
-            None => build_fallback_field_id_map(parquet_schema),
+            None => {
+                let from_arrow = build_field_id_map_from_arrow(arrow_schema);
+                if !from_arrow.is_empty() {
+                    from_arrow
+                } else {
+                    build_fallback_field_id_map(parquet_schema)
+                }
+            }
         };
 
         Ok((iceberg_field_ids, field_id_map))
@@ -268,6 +284,27 @@ pub(super) fn build_field_id_map(
     }
 
     Ok(Some(column_map))
+}
+
+/// Build a field-ID -> parquet-leaf-index map from the arrow schema's
+/// `PARQUET:field_id` leaf metadata. Returns an empty map if no leaf has
+/// that metadata.
+///
+/// Used after the reader has applied a name mapping (or fallback ids) to
+/// the arrow schema for parquet files whose own column metadata lacks field
+/// ids. The arrow leaf order matches the parquet leaf order one-to-one, so
+/// the index produced here is directly usable as a parquet column index.
+fn build_field_id_map_from_arrow(arrow_schema: &ArrowSchemaRef) -> HashMap<i32, usize> {
+    let mut map = HashMap::new();
+    arrow_schema.fields().filter_leaves(|idx, field| {
+        if let Some(field_id_str) = field.metadata().get(PARQUET_FIELD_ID_META_KEY)
+            && let Ok(field_id) = field_id_str.parse::<i32>()
+        {
+            map.insert(field_id, idx);
+        }
+        false
+    });
+    map
 }
 
 /// Build a fallback field ID map for Parquet files without embedded field IDs.
