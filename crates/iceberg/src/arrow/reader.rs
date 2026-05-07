@@ -490,6 +490,7 @@ impl ArrowReader {
         if let Some(predicate) = final_predicate {
             let (iceberg_field_ids, field_id_map) = Self::build_field_id_set_and_map(
                 record_batch_stream_builder.parquet_schema(),
+                record_batch_stream_builder.schema(),
                 &predicate,
             )?;
 
@@ -749,6 +750,7 @@ impl ArrowReader {
 
     fn build_field_id_set_and_map(
         parquet_schema: &SchemaDescriptor,
+        arrow_schema: &ArrowSchemaRef,
         predicate: &BoundPredicate,
     ) -> Result<(HashSet<i32>, HashMap<i32, usize>)> {
         // Collects all Iceberg field IDs referenced in the filter predicate
@@ -760,26 +762,46 @@ impl ArrowReader {
         let iceberg_field_ids = collector.field_ids();
 
         let debug = std::env::var("ICEBERG_BLOOM_DEBUG").is_ok();
-        // Without embedded field IDs, we fall back to position-based mapping for compatibility
+        // Field-id map source priority:
+        //   1. parquet schema's embedded field-ids (when the writer tagged
+        //      every leaf — covers files written natively by iceberg-rust).
+        //   2. arrow schema's `PARQUET:field_id` leaf metadata. The reader
+        //      populates this from `schema.name-mapping.default` (when set
+        //      on the table) before this point, so files written without
+        //      embedded ids — Hive/Spark migrations, or any writer that
+        //      drops ids on nested leaves — still resolve correctly.
+        //   3. position-based 1-indexed fallback. Only correct when the
+        //      iceberg schema's field ids exactly match leaf position + 1.
         let field_id_map = match build_field_id_map(parquet_schema)? {
             Some(map) => {
                 if debug {
                     eprintln!(
-                        "[iceberg::field_ids] using EMBEDDED field-id map ({} entries)",
+                        "[iceberg::field_ids] using EMBEDDED parquet field-id map ({} entries)",
                         map.len(),
                     );
                 }
                 map
             }
             None => {
-                let map = build_fallback_field_id_map(parquet_schema);
-                if debug {
-                    eprintln!(
-                        "[iceberg::field_ids] WARNING: at least one parquet leaf is missing field-id metadata; falling back to position-based 1-indexed mapping ({} entries). This breaks lookups for any column that doesn't sit at iceberg field id == parquet leaf position + 1.",
-                        map.len(),
-                    );
+                let from_arrow = build_field_id_map_from_arrow(arrow_schema);
+                if !from_arrow.is_empty() {
+                    if debug {
+                        eprintln!(
+                            "[iceberg::field_ids] using ARROW field-id map (parquet leaves missing field-id metadata; arrow schema populated by name mapping or fallback) — {} entries",
+                            from_arrow.len(),
+                        );
+                    }
+                    from_arrow
+                } else {
+                    let map = build_fallback_field_id_map(parquet_schema);
+                    if debug {
+                        eprintln!(
+                            "[iceberg::field_ids] WARNING: no field-id metadata on parquet OR arrow leaves; falling back to position-based 1-indexed mapping ({} entries). Lookups will only be correct when iceberg field id == parquet leaf position + 1.",
+                            map.len(),
+                        );
+                    }
+                    map
                 }
-                map
             }
         };
 
@@ -1240,6 +1262,27 @@ fn build_field_id_map(parquet_schema: &SchemaDescriptor) -> Result<Option<HashMa
     }
 
     Ok(Some(column_map))
+}
+
+/// Build a field-ID → parquet-leaf-index map from the arrow schema's
+/// `PARQUET:field_id` leaf metadata. Returns an empty map if no leaf has
+/// that metadata.
+///
+/// Used after the reader has applied a name mapping (or fallback ids) to
+/// the arrow schema for parquet files whose own column metadata lacks
+/// field ids. The arrow leaf order matches the parquet leaf order one-to-one,
+/// so the index produced here is directly usable as a parquet column index.
+fn build_field_id_map_from_arrow(arrow_schema: &ArrowSchemaRef) -> HashMap<i32, usize> {
+    let mut map = HashMap::new();
+    arrow_schema.fields().filter_leaves(|idx, field| {
+        if let Some(field_id_str) = field.metadata().get(PARQUET_FIELD_ID_META_KEY)
+            && let Ok(field_id) = field_id_str.parse::<i32>()
+        {
+            map.insert(field_id, idx);
+        }
+        false
+    });
+    map
 }
 
 /// Build a fallback field ID map for Parquet files without embedded field IDs.
@@ -2360,9 +2403,29 @@ message schema {
         let predicate = Reference::new("nested.value").equal_to(Datum::long(42));
         let bound_predicate = predicate.bind(schema.clone(), true).unwrap();
 
-        let (iceberg_field_ids, field_id_map) =
-            ArrowReader::build_field_id_set_and_map(&parquet_schema, &bound_predicate)
-                .expect("build field id map");
+        // Build a minimal arrow schema mirroring the parquet leaves with
+        // field-id metadata so the helper finds parquet ids on the parquet
+        // side directly (the new arrow-fallback path is exercised by the
+        // higher-level read tests).
+        let arrow_schema_for_test = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "nested",
+                DataType::Struct(arrow_schema::Fields::from(vec![Field::new(
+                    "value",
+                    DataType::Int64,
+                    false,
+                )])),
+                false,
+            ),
+        ]));
+
+        let (iceberg_field_ids, field_id_map) = ArrowReader::build_field_id_set_and_map(
+            &parquet_schema,
+            &arrow_schema_for_test,
+            &bound_predicate,
+        )
+        .expect("build field id map");
 
         ArrowReader::get_row_filter(
             &bound_predicate,
