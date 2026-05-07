@@ -759,11 +759,42 @@ impl ArrowReader {
 
         let iceberg_field_ids = collector.field_ids();
 
+        let debug = std::env::var("ICEBERG_BLOOM_DEBUG").is_ok();
         // Without embedded field IDs, we fall back to position-based mapping for compatibility
         let field_id_map = match build_field_id_map(parquet_schema)? {
-            Some(map) => map,
-            None => build_fallback_field_id_map(parquet_schema),
+            Some(map) => {
+                if debug {
+                    eprintln!(
+                        "[iceberg::field_ids] using EMBEDDED field-id map ({} entries)",
+                        map.len(),
+                    );
+                }
+                map
+            }
+            None => {
+                let map = build_fallback_field_id_map(parquet_schema);
+                if debug {
+                    eprintln!(
+                        "[iceberg::field_ids] WARNING: at least one parquet leaf is missing field-id metadata; falling back to position-based 1-indexed mapping ({} entries). This breaks lookups for any column that doesn't sit at iceberg field id == parquet leaf position + 1.",
+                        map.len(),
+                    );
+                }
+                map
+            }
         };
+
+        if debug {
+            for fid in iceberg_field_ids.iter() {
+                let parquet_idx = field_id_map.get(fid).copied();
+                let parquet_col = parquet_idx.and_then(|idx| {
+                    parquet_schema.columns().get(idx).map(|c| c.path().string())
+                });
+                eprintln!(
+                    "[iceberg::field_ids] predicate references iceberg field_id={fid} -> parquet idx={:?} parquet path={:?}",
+                    parquet_idx, parquet_col,
+                );
+            }
+        }
 
         Ok((iceberg_field_ids, field_id_map))
     }
