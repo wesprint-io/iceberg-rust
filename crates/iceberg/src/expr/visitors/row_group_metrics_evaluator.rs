@@ -292,29 +292,54 @@ impl BoundPredicateVisitor for RowGroupMetricsEvaluator<'_> {
         _predicate: &BoundPredicate,
     ) -> Result<bool> {
         let field_id = reference.field().id;
+        let debug = std::env::var("ICEBERG_BLOOM_DEBUG").is_ok();
 
         if self.contains_nulls_only(field_id) {
+            if debug {
+                eprintln!(
+                    "[iceberg::minmax] eq CANT_MATCH (nulls_only) field_id={field_id} field={} datum={:?}",
+                    reference.field().name, datum,
+                );
+            }
             return ROW_GROUP_CANT_MATCH;
         }
 
-        if let Some(lower_bound) = self.min_value(field_id)? {
+        let lower = self.min_value(field_id)?;
+        let upper = self.max_value(field_id)?;
+
+        if let Some(lower_bound) = &lower {
             if lower_bound.is_nan() {
-                // NaN indicates unreliable bounds.
-                // See the InclusiveMetricsEvaluator docs for more.
                 return ROW_GROUP_MIGHT_MATCH;
             } else if lower_bound.gt(datum) {
+                if debug {
+                    eprintln!(
+                        "[iceberg::minmax] eq CANT_MATCH (lower>datum) field_id={field_id} field={} lower={:?} datum={:?}",
+                        reference.field().name, lower_bound, datum,
+                    );
+                }
                 return ROW_GROUP_CANT_MATCH;
             }
         }
 
-        if let Some(upper_bound) = self.max_value(field_id)? {
+        if let Some(upper_bound) = &upper {
             if upper_bound.is_nan() {
-                // NaN indicates unreliable bounds.
-                // See the InclusiveMetricsEvaluator docs for more.
                 return ROW_GROUP_MIGHT_MATCH;
             } else if upper_bound.lt(datum) {
+                if debug {
+                    eprintln!(
+                        "[iceberg::minmax] eq CANT_MATCH (upper<datum) field_id={field_id} field={} upper={:?} datum={:?}",
+                        reference.field().name, upper_bound, datum,
+                    );
+                }
                 return ROW_GROUP_CANT_MATCH;
             }
+        }
+
+        if debug {
+            eprintln!(
+                "[iceberg::minmax] eq MIGHT_MATCH field_id={field_id} field={} lower={:?} upper={:?} datum={:?}",
+                reference.field().name, lower, upper, datum,
+            );
         }
 
         ROW_GROUP_MIGHT_MATCH
