@@ -87,7 +87,12 @@ impl<'a> RowGroupBloomFilterEvaluator<'a> {
         Some((sbbf, column_descr))
     }
 
-    fn datum_might_be_in(&self, sbbf: &Sbbf, column_descr: &ColumnDescriptor, datum: &Datum) -> bool {
+    fn datum_might_be_in(
+        &self,
+        sbbf: &Sbbf,
+        column_descr: &ColumnDescriptor,
+        datum: &Datum,
+    ) -> bool {
         match datum_to_bloom_filter_bytes(datum, column_descr) {
             Some(bytes) => sbbf.check(bytes.as_slice()),
             // Unsupported encoding: be conservative and assume the value
@@ -139,11 +144,7 @@ impl BoundPredicateVisitor for RowGroupBloomFilterEvaluator<'_> {
         ROW_GROUP_MIGHT_MATCH
     }
 
-    fn is_nan(
-        &mut self,
-        _reference: &BoundReference,
-        _predicate: &BoundPredicate,
-    ) -> Result<bool> {
+    fn is_nan(&mut self, _reference: &BoundReference, _predicate: &BoundPredicate) -> Result<bool> {
         ROW_GROUP_MIGHT_MATCH
     }
 
@@ -373,12 +374,7 @@ impl BoundPredicateVisitor for BloomFilterableColumnCollector<'_> {
         Ok(())
     }
 
-    fn starts_with(
-        &mut self,
-        _r: &BoundReference,
-        _d: &Datum,
-        _p: &BoundPredicate,
-    ) -> Result<()> {
+    fn starts_with(&mut self, _r: &BoundReference, _d: &Datum, _p: &BoundPredicate) -> Result<()> {
         Ok(())
     }
 
@@ -439,10 +435,22 @@ fn datum_to_bloom_filter_bytes(datum: &Datum, column_descr: &ColumnDescriptor) -
             Some(value.to_ne_bytes().to_vec())
         }
         (PrimitiveLiteral::Float(value), ParquetPhysicalType::FLOAT) => {
-            Some(value.into_inner().to_ne_bytes().to_vec())
+            let value = value.into_inner();
+            if value == 0.0 {
+                // Arrow equality treats +0.0 and -0.0 as equal, but parquet
+                // bloom filters hash the raw IEEE bytes. Avoid pruning on
+                // either zero encoding to prevent false negatives.
+                return None;
+            }
+            Some(value.to_ne_bytes().to_vec())
         }
         (PrimitiveLiteral::Double(value), ParquetPhysicalType::DOUBLE) => {
-            Some(value.into_inner().to_ne_bytes().to_vec())
+            let value = value.into_inner();
+            if value == 0.0 {
+                // See the FLOAT zero case above.
+                return None;
+            }
+            Some(value.to_ne_bytes().to_vec())
         }
 
         // String / Binary as variable-length BYTE_ARRAY.
@@ -556,11 +564,9 @@ message schema {
         // Parquet writes Decimal128 as the 9 trailing big-endian bytes of the
         // i128 mantissa for a 20-digit decimal.
         let mantissa: i128 = 12_345_678_901_234_567_890_i128;
-        let datum = Datum::decimal_with_precision(
-            mantissa.to_string().parse().expect("parse decimal"),
-            20,
-        )
-        .expect("build decimal datum");
+        let datum =
+            Datum::decimal_with_precision(mantissa.to_string().parse().expect("parse decimal"), 20)
+                .expect("build decimal datum");
 
         let our_bytes = datum_to_bloom_filter_bytes(&datum, value_descr)
             .expect("encoder should support decimal(20,0) FLB");
@@ -576,6 +582,8 @@ message schema {
   required int32 i32_col = 1;
   required int64 i64_col = 2;
   required binary str_col (STRING) = 3;
+  required float f32_col = 4;
+  required double f64_col = 5;
 }
         ";
         let parquet_type = parse_message_type(schema_str).expect("parse");
@@ -583,6 +591,8 @@ message schema {
         let i32_descr = &schema.columns()[0];
         let i64_descr = &schema.columns()[1];
         let str_descr = &schema.columns()[2];
+        let f32_descr = &schema.columns()[3];
+        let f64_descr = &schema.columns()[4];
 
         assert_eq!(
             datum_to_bloom_filter_bytes(&Datum::int(42), i32_descr).expect("i32"),
@@ -595,6 +605,22 @@ message schema {
         assert_eq!(
             datum_to_bloom_filter_bytes(&Datum::string("hello"), str_descr).expect("string"),
             b"hello".to_vec(),
+        );
+        assert_eq!(
+            datum_to_bloom_filter_bytes(&Datum::float(1.25), f32_descr).expect("f32"),
+            1.25_f32.to_ne_bytes().to_vec(),
+        );
+        assert_eq!(
+            datum_to_bloom_filter_bytes(&Datum::double(1.25), f64_descr).expect("f64"),
+            1.25_f64.to_ne_bytes().to_vec(),
+        );
+        assert!(
+            datum_to_bloom_filter_bytes(&Datum::float(0.0), f32_descr).is_none(),
+            "float zero must stay conservative because +0.0 and -0.0 compare equal"
+        );
+        assert!(
+            datum_to_bloom_filter_bytes(&Datum::double(-0.0), f64_descr).is_none(),
+            "double zero must stay conservative because +0.0 and -0.0 compare equal"
         );
     }
 
@@ -633,9 +659,13 @@ message schema {
         let predicate = Reference::new("nested.value")
             .equal_to(Datum::decimal_with_precision("9999".parse().unwrap(), 20).unwrap());
         let bound = predicate.bind(schema.clone(), true).unwrap();
-        let result =
-            RowGroupBloomFilterEvaluator::eval(&bound, &bloom_filters, &field_id_map, parquet_columns)
-                .unwrap();
+        let result = RowGroupBloomFilterEvaluator::eval(
+            &bound,
+            &bloom_filters,
+            &field_id_map,
+            parquet_columns,
+        )
+        .unwrap();
         assert!(!result, "9999 not in bloom -> row group should be skipped");
 
         // Predicate that the bloom filter cannot disprove (1234 is present).

@@ -23,9 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use arrow_schema::{
-    DataType, Field, Fields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
-};
+use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ProjectionMask};
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 
@@ -417,9 +415,8 @@ fn apply_name_mapping_to_arrow_field(
         metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string());
     }
 
-    let nested_candidates: &[Arc<crate::spec::MappedField>] = mapped_field
-        .map(|m| m.fields())
-        .unwrap_or_default();
+    let nested_candidates: &[Arc<crate::spec::MappedField>] =
+        mapped_field.map(|m| m.fields()).unwrap_or_default();
 
     let new_data_type = match field.data_type() {
         DataType::Struct(children) => {
@@ -429,12 +426,14 @@ fn apply_name_mapping_to_arrow_field(
                 .collect();
             DataType::Struct(Fields::from(new_children))
         }
-        DataType::List(element) => {
-            DataType::List(apply_name_mapping_to_arrow_field(element, nested_candidates))
-        }
-        DataType::LargeList(element) => {
-            DataType::LargeList(apply_name_mapping_to_arrow_field(element, nested_candidates))
-        }
+        DataType::List(element) => DataType::List(apply_name_mapping_to_arrow_field(
+            element,
+            nested_candidates,
+        )),
+        DataType::LargeList(element) => DataType::LargeList(apply_name_mapping_to_arrow_field(
+            element,
+            nested_candidates,
+        )),
         DataType::Map(struct_field, sorted) => DataType::Map(
             apply_name_mapping_to_arrow_field(struct_field, nested_candidates),
             *sorted,
@@ -442,10 +441,7 @@ fn apply_name_mapping_to_arrow_field(
         other => other.clone(),
     };
 
-    Arc::new(
-        Field::new(field.name(), new_data_type, field.is_nullable())
-            .with_metadata(metadata),
-    )
+    Arc::new(Field::new(field.name(), new_data_type, field.is_nullable()).with_metadata(metadata))
 }
 
 /// Add position-based fallback field IDs to Arrow schema for Parquet files lacking them.

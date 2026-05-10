@@ -23,10 +23,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use parquet::arrow::ProjectionMask;
-use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter, RowSelection};
-use parquet::arrow::ParquetRecordBatchStreamBuilder;
+use parquet::arrow::async_reader::AsyncFileReader;
+use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::file::metadata::ParquetMetaData;
 use parquet::schema::types::SchemaDescriptor;
 
@@ -600,11 +599,15 @@ message schema {
                 PARQUET_FIELD_ID_META_KEY.to_string(),
                 "1".to_string(),
             )])),
-            Field::new("nested", DataType::Struct(nested_struct_fields.clone()), false)
-                .with_metadata(HashMap::from([(
-                    PARQUET_FIELD_ID_META_KEY.to_string(),
-                    "2".to_string(),
-                )])),
+            Field::new(
+                "nested",
+                DataType::Struct(nested_struct_fields.clone()),
+                false,
+            )
+            .with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
         ]));
 
         let id_data = Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
@@ -671,7 +674,11 @@ message schema {
             .as_any()
             .downcast_ref::<Int32Array>()
             .expect("id is int32");
-        assert_eq!(id_values.values(), &[2_i32], "expected the row with value=20");
+        assert_eq!(
+            id_values.values(),
+            &[2_i32],
+            "expected the row with value=20"
+        );
     }
 
     /// End-to-end check that parquet bloom filter pruning is consulted during
