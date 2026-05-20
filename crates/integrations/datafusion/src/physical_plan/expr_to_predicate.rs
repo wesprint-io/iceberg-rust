@@ -198,9 +198,43 @@ fn to_iceberg_predicate(expr: &Expr) -> TransformedResult {
             }
         }
         Expr::ScalarFunction(ScalarFunction { func, args }) => {
-            scalar_function_to_iceberg_predicate(func.name(), args)
+            let name = func.name();
+            if name == "get_field" && args.len() == 2 {
+                match nested_field_path(expr) {
+                    Some(path) => TransformedResult::Column(Reference::new(path.join("."))),
+                    None => TransformedResult::NotTransformed,
+                }
+            } else {
+                scalar_function_to_iceberg_predicate(name, args)
+            }
         }
         _ => TransformedResult::NotTransformed,
+    }
+}
+
+/// Walks a `get_field(...)` chain rooted at a column and returns the
+/// dot-separated path components, or `None` if the expression isn't a
+/// pure column-then-static-field-access chain.
+///
+/// `get_field(get_field(payload, 'visit_id'), 'user_uid')` →
+/// `Some(["payload", "visit_id", "user_uid"])`.
+fn nested_field_path(expr: &Expr) -> Option<Vec<String>> {
+    match expr {
+        Expr::Column(column) => Some(vec![column.name().to_string()]),
+        Expr::ScalarFunction(ScalarFunction { func, args })
+            if func.name() == "get_field" && args.len() == 2 =>
+        {
+            let field_name = match &args[1] {
+                Expr::Literal(ScalarValue::Utf8(Some(name)), _)
+                | Expr::Literal(ScalarValue::LargeUtf8(Some(name)), _)
+                | Expr::Literal(ScalarValue::Utf8View(Some(name)), _) => name.clone(),
+                _ => return None,
+            };
+            let mut path = nested_field_path(&args[0])?;
+            path.push(field_name);
+            Some(path)
+        }
+        _ => None,
     }
 }
 
@@ -324,7 +358,7 @@ fn scalar_value_to_datum(value: &ScalarValue) -> Option<Datum> {
 mod tests {
     use std::collections::HashMap;
 
-    use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
     use datafusion::common::DFSchema;
     use datafusion::logical_expr::utils::split_conjunction;
     use datafusion::prelude::{Expr, SessionContext};
@@ -356,12 +390,46 @@ mod tests {
     }
 
     fn convert_to_iceberg_predicate(sql: &str) -> Option<Predicate> {
-        let df_schema = create_test_schema();
+        convert_with_schema(sql, &create_test_schema())
+    }
+
+    fn convert_with_schema(sql: &str, df_schema: &DFSchema) -> Option<Predicate> {
         let expr = SessionContext::new()
-            .parse_sql_expr(sql, &df_schema)
+            .parse_sql_expr(sql, df_schema)
             .unwrap();
         let exprs: Vec<Expr> = split_conjunction(&expr).into_iter().cloned().collect();
         convert_filters_to_predicate(&exprs[..])
+    }
+
+    fn field_with_id(name: &str, data_type: DataType, id: u32) -> Field {
+        Field::new(name, data_type, true).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            id.to_string(),
+        )]))
+    }
+
+    /// Schema with a nested struct:
+    ///
+    /// ```text
+    /// baz: struct {
+    ///   a: int,
+    ///   b: struct {
+    ///     c: bigint,
+    ///   },
+    /// }
+    /// ```
+    fn create_nested_test_schema() -> DFSchema {
+        let inner_fields = Fields::from(vec![field_with_id("c", DataType::Int64, 7)]);
+        let baz_fields = Fields::from(vec![
+            field_with_id("a", DataType::Int32, 5),
+            field_with_id("b", DataType::Struct(inner_fields), 6),
+        ]);
+        let arrow_schema = Schema::new(vec![field_with_id(
+            "baz",
+            DataType::Struct(baz_fields),
+            10,
+        )]);
+        DFSchema::try_from_qualified_schema("my_table", &arrow_schema).unwrap()
     }
 
     #[test]
@@ -738,5 +806,53 @@ mod tests {
         let sql = "isnan(qux + 1)";
         let predicate = convert_to_iceberg_predicate(sql);
         assert_eq!(predicate, None);
+    }
+
+    #[test]
+    fn test_predicate_conversion_with_struct_field_access() {
+        let schema = create_nested_test_schema();
+        let predicate = convert_with_schema("baz['a'] = 1", &schema).unwrap();
+        assert_eq!(
+            predicate,
+            Reference::new("baz.a").equal_to(Datum::long(1))
+        );
+    }
+
+    #[test]
+    fn test_predicate_conversion_with_doubly_nested_field_access() {
+        let schema = create_nested_test_schema();
+        let predicate = convert_with_schema("baz['b']['c'] = 2", &schema).unwrap();
+        assert_eq!(
+            predicate,
+            Reference::new("baz.b.c").equal_to(Datum::long(2))
+        );
+    }
+
+    #[test]
+    fn test_predicate_conversion_with_nested_and_top_level_conjunction() {
+        let schema = create_nested_test_schema();
+        let predicate = convert_with_schema("baz['b']['c'] = 2 AND baz['a'] > 0", &schema)
+            .unwrap();
+        let expected = Reference::new("baz.b.c")
+            .equal_to(Datum::long(2))
+            .and(Reference::new("baz.a").greater_than(Datum::long(0)));
+        assert_eq!(predicate, expected);
+    }
+
+    #[test]
+    fn test_predicate_conversion_with_nested_field_in_list() {
+        let schema = create_nested_test_schema();
+        let predicate = convert_with_schema("baz['a'] IN (1, 2)", &schema).unwrap();
+        assert_eq!(
+            predicate,
+            Reference::new("baz.a").is_in([Datum::long(1), Datum::long(2)])
+        );
+    }
+
+    #[test]
+    fn test_predicate_conversion_with_nested_field_is_null() {
+        let schema = create_nested_test_schema();
+        let predicate = convert_with_schema("baz['a'] IS NULL", &schema).unwrap();
+        assert_eq!(predicate, Reference::new("baz.a").is_null());
     }
 }
