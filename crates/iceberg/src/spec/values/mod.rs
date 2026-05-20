@@ -31,7 +31,7 @@ mod tests;
 
 // Re-export all public types
 pub use datum::Datum;
-pub use decimal_utils::Decimal;
+pub use decimal_utils::{Decimal, decimal_from_i128_with_scale};
 pub use literal::Literal;
 pub use map::Map;
 pub use primitive::PrimitiveLiteral;

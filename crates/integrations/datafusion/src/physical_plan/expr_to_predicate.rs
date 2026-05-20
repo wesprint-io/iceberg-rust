@@ -22,7 +22,7 @@ use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{Expr, Like, Operator};
 use datafusion::scalar::ScalarValue;
 use iceberg::expr::{BinaryExpression, Predicate, PredicateOperator, Reference, UnaryExpression};
-use iceberg::spec::{Datum, PrimitiveLiteral};
+use iceberg::spec::{Datum, PrimitiveLiteral, decimal_from_i128_with_scale};
 
 // A datafusion expression could be an Iceberg predicate, column, or literal.
 enum TransformedResult {
@@ -355,6 +355,12 @@ fn scalar_value_to_datum(value: &ScalarValue) -> Option<Datum> {
         // See unit tests for how those conversions would work if needed.
         ScalarValue::TimestampMicrosecond(Some(v), _) => Some(Datum::timestamp_micros(*v)),
         ScalarValue::TimestampNanosecond(Some(v), _) => Some(Datum::timestamp_nanos(*v)),
+        // Iceberg only supports non-negative scales and precisions up to 38;
+        // negative-scale decimals (datafusion allows them) can't be expressed.
+        ScalarValue::Decimal128(Some(mantissa), precision, scale) if *scale >= 0 => {
+            let decimal = decimal_from_i128_with_scale(*mantissa, *scale as u32);
+            Datum::decimal_with_precision(decimal, *precision as u32).ok()
+        }
         _ => None,
     }
 }
@@ -859,6 +865,40 @@ mod tests {
         let schema = create_nested_test_schema();
         let predicate = convert_with_schema("baz['a'] IS NULL", &schema).unwrap();
         assert_eq!(predicate, Reference::new("baz.a").is_null());
+    }
+
+    #[test]
+    fn test_scalar_value_to_datum_decimal128() {
+        use datafusion::common::ScalarValue;
+        use iceberg::spec::decimal_from_i128_with_scale;
+
+        // scale = 0 (matches the `decimal(20, 0)` user_uid case)
+        let datum = super::scalar_value_to_datum(&ScalarValue::Decimal128(
+            Some(226217008391990_i128),
+            20,
+            0,
+        ));
+        let expected =
+            Datum::decimal_with_precision(decimal_from_i128_with_scale(226217008391990, 0), 20)
+                .unwrap();
+        assert_eq!(datum, Some(expected));
+
+        // scale > 0
+        let datum =
+            super::scalar_value_to_datum(&ScalarValue::Decimal128(Some(12345_i128), 5, 2));
+        let expected = Datum::decimal_with_precision(decimal_from_i128_with_scale(12345, 2), 5)
+            .unwrap();
+        assert_eq!(datum, Some(expected));
+
+        // negative scale (iceberg-unsupported) and None payload both drop out
+        assert_eq!(
+            super::scalar_value_to_datum(&ScalarValue::Decimal128(Some(1), 5, -2)),
+            None
+        );
+        assert_eq!(
+            super::scalar_value_to_datum(&ScalarValue::Decimal128(None, 5, 0)),
+            None
+        );
     }
 
     /// Some datafusion paths emit `get_field(base, "f1", "f2", ...)` as a
