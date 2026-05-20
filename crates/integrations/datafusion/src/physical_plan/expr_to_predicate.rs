@@ -199,7 +199,7 @@ fn to_iceberg_predicate(expr: &Expr) -> TransformedResult {
         }
         Expr::ScalarFunction(ScalarFunction { func, args }) => {
             let name = func.name();
-            if name == "get_field" && args.len() == 2 {
+            if name == "get_field" && args.len() >= 2 {
                 match nested_field_path(expr) {
                     Some(path) => TransformedResult::Column(Reference::new(path.join("."))),
                     None => TransformedResult::NotTransformed,
@@ -216,22 +216,27 @@ fn to_iceberg_predicate(expr: &Expr) -> TransformedResult {
 /// dot-separated path components, or `None` if the expression isn't a
 /// pure column-then-static-field-access chain.
 ///
-/// `get_field(get_field(payload, 'visit_id'), 'user_uid')` →
-/// `Some(["payload", "visit_id", "user_uid"])`.
+/// Handles both shapes datafusion can produce:
+/// - nested two-arg calls: `get_field(get_field(payload, 'visit_id'), 'user_uid')`
+/// - one variadic call: `get_field(payload, 'visit_id', 'user_uid')`
+///
+/// Both yield `Some(["payload", "visit_id", "user_uid"])`.
 fn nested_field_path(expr: &Expr) -> Option<Vec<String>> {
     match expr {
         Expr::Column(column) => Some(vec![column.name().to_string()]),
         Expr::ScalarFunction(ScalarFunction { func, args })
-            if func.name() == "get_field" && args.len() == 2 =>
+            if func.name() == "get_field" && args.len() >= 2 =>
         {
-            let field_name = match &args[1] {
-                Expr::Literal(ScalarValue::Utf8(Some(name)), _)
-                | Expr::Literal(ScalarValue::LargeUtf8(Some(name)), _)
-                | Expr::Literal(ScalarValue::Utf8View(Some(name)), _) => name.clone(),
-                _ => return None,
-            };
             let mut path = nested_field_path(&args[0])?;
-            path.push(field_name);
+            for arg in &args[1..] {
+                let field_name = match arg {
+                    Expr::Literal(ScalarValue::Utf8(Some(name)), _)
+                    | Expr::Literal(ScalarValue::LargeUtf8(Some(name)), _)
+                    | Expr::Literal(ScalarValue::Utf8View(Some(name)), _) => name.clone(),
+                    _ => return None,
+                };
+                path.push(field_name);
+            }
             Some(path)
         }
         _ => None,
@@ -854,5 +859,28 @@ mod tests {
         let schema = create_nested_test_schema();
         let predicate = convert_with_schema("baz['a'] IS NULL", &schema).unwrap();
         assert_eq!(predicate, Reference::new("baz.a").is_null());
+    }
+
+    /// Some datafusion paths emit `get_field(base, "f1", "f2", ...)` as a
+    /// single variadic call rather than nested two-arg calls (see
+    /// `datafusion::functions::core::expr_fn::get_field_path`). Verify the
+    /// translator collapses the variadic form to the same dotted reference.
+    #[test]
+    fn test_predicate_conversion_with_variadic_get_field_path() {
+        use datafusion::common::Column;
+        use datafusion::functions::core::expr_fn::get_field_path;
+        use datafusion::logical_expr::lit;
+        use datafusion::prelude::Expr;
+
+        let nested = get_field_path(
+            Expr::Column(Column::from_name("baz")),
+            vec![lit("b"), lit("c")],
+        );
+        let filter = nested.eq(lit(2_i64));
+        let predicate = convert_filters_to_predicate(&[filter]).unwrap();
+        assert_eq!(
+            predicate,
+            Reference::new("baz.b.c").equal_to(Datum::long(2))
+        );
     }
 }
