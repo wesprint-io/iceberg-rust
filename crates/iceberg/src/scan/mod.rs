@@ -116,6 +116,11 @@ impl<'a> TableScanBuilder<'a> {
     }
 
     /// Select some columns of the table.
+    ///
+    /// Column names may be dotted paths into nested structs, e.g.
+    /// `select(["payload.tagged"])` projects every leaf under the
+    /// `payload.tagged` subtree. Leaf expansion is performed at read time
+    /// by the arrow projection-mask builder.
     pub fn select(mut self, column_names: impl IntoIterator<Item = impl ToString>) -> Self {
         self.column_names = Some(
             column_names
@@ -259,17 +264,18 @@ impl<'a> TableScanBuilder<'a> {
                 )
             })?;
 
-            schema
-                .as_struct()
-                .field_by_id(field_id)
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::FeatureUnsupported,
-                        format!(
-                        "Column {column_name} is not a direct child of schema but a nested field, which is not supported now. Schema: {schema}"
+            // The reader's `get_arrow_projection_mask` recursively expands
+            // struct/list/map field IDs to their parquet leaves, so nested-tree
+            // projection works as-is. Just confirm the field exists somewhere
+            // in the schema (searches the full nested tree).
+            if schema.field_by_id(field_id).is_none() {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Field id {field_id} (resolved from `{column_name}`) not found in table. Schema: {schema}"
                     ),
-                )
-            })?;
+                ));
+            }
 
             field_ids.push(field_id);
         }
@@ -1247,6 +1253,124 @@ pub mod tests {
 
         let table_scan = table.scan().select(["x", "y", "z", "a", "b"]).build();
         assert!(table_scan.is_err());
+    }
+
+    /// Build a `Table` whose current schema has a nested struct `payload`
+    /// containing two nested struct children (`tagged`, `untagged`), each
+    /// with their own leaf fields. Used to exercise dotted-path projection
+    /// in `TableScan::select`.
+    fn nested_schema_table() -> Table {
+        // payload (id=10): struct {
+        //   tagged (id=11): struct { is_set (id=12) bool, user_uid (id=13) long },
+        //   untagged (id=14): struct { is_set (id=15) bool },
+        // }
+        let payload = NestedField::required(
+            10,
+            "payload",
+            Type::Struct(StructType::new(vec![
+                Arc::new(NestedField::required(
+                    11,
+                    "tagged",
+                    Type::Struct(StructType::new(vec![
+                        Arc::new(NestedField::required(
+                            12,
+                            "is_set",
+                            Type::Primitive(PrimitiveType::Boolean),
+                        )),
+                        Arc::new(NestedField::required(
+                            13,
+                            "user_uid",
+                            Type::Primitive(PrimitiveType::Long),
+                        )),
+                    ])),
+                )),
+                Arc::new(NestedField::required(
+                    14,
+                    "untagged",
+                    Type::Struct(StructType::new(vec![Arc::new(NestedField::required(
+                        15,
+                        "is_set",
+                        Type::Primitive(PrimitiveType::Boolean),
+                    ))])),
+                )),
+            ])),
+        );
+
+        let schema = Schema::builder()
+            .with_schema_id(2)
+            .with_fields(vec![Arc::new(payload)])
+            .build()
+            .unwrap();
+
+        // Start from the existing example metadata, then swap in the
+        // nested schema as the current one.
+        let mut table_metadata = TableTestFixture::new().table.metadata().clone();
+        let schema_id = schema.schema_id();
+        table_metadata.current_schema_id = schema_id;
+        table_metadata
+            .schemas
+            .insert(schema_id, Arc::new(schema));
+        // Clear snapshots so build() takes the no-snapshot path; we only
+        // need the builder to succeed and stash field_ids on PlanContext.
+        // But the no-snapshot path produces None plan_context — instead
+        // keep the snapshots and point the current snapshot's schema at
+        // our nested schema.
+        let current_snapshot_id = table_metadata.current_snapshot_id.unwrap();
+        let snap = table_metadata
+            .snapshots
+            .get(&current_snapshot_id)
+            .unwrap()
+            .clone();
+        // Snapshot is `Arc<Snapshot>`; replace with a copy whose schema_id
+        // matches our nested schema.
+        let mut new_snap = (*snap).clone();
+        new_snap.schema_id = Some(schema_id);
+        table_metadata
+            .snapshots
+            .insert(current_snapshot_id, Arc::new(new_snap));
+
+        let file_io = FileIO::new_with_fs();
+        Table::builder()
+            .metadata(table_metadata)
+            .identifier(TableIdent::from_strs(["db", "nested"]).unwrap())
+            .file_io(file_io)
+            .metadata_location("/tmp/iceberg-rust-nested-test/v1.json")
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_select_nested_field_path() {
+        let table = nested_schema_table();
+        let scan = table
+            .scan()
+            .select(["payload.tagged"])
+            .build()
+            .expect("dotted-path select should succeed");
+
+        let plan_context = scan
+            .plan_context
+            .as_ref()
+            .expect("table has a snapshot, so plan_context is set");
+        // We push the field ID of the nested struct itself (11), not its
+        // leaves — leaf expansion is performed at read time by the arrow
+        // projection-mask builder.
+        assert_eq!(plan_context.field_ids.as_slice(), &[11]);
+    }
+
+    #[test]
+    fn test_select_nested_field_path_not_found() {
+        let table = nested_schema_table();
+        let err = table
+            .scan()
+            .select(["payload.not_a_field"])
+            .build()
+            .expect_err("unknown dotted path should error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not found in table"),
+            "unexpected error message: {msg}"
+        );
     }
 
     #[test]
