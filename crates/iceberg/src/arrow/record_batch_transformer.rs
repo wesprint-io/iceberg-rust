@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{
@@ -350,6 +350,27 @@ impl RecordBatchTransformer {
         projected_iceberg_field_ids: &[i32],
         constant_fields: &HashMap<i32, Datum>,
     ) -> Result<BatchTransform> {
+        // Short-circuit: dotted-path projections push a nested field id into
+        // `projected_iceberg_field_ids`. The parquet reader's projection mask
+        // already trimmed the source batch to that leaf (preserving its
+        // enclosing struct path), so when no schema-evolution transforms or
+        // constant injections are required, the source batch IS the desired
+        // output — pass it through unchanged. The full target-schema
+        // construction below only indexes top-level arrow fields by id and
+        // would raise `field not found` on a nested id.
+        if constant_fields.is_empty() {
+            let mut source_ids = HashSet::new();
+            for field in source_schema.fields().iter() {
+                Self::collect_field_ids(field, &mut source_ids)?;
+            }
+            if projected_iceberg_field_ids
+                .iter()
+                .all(|id| source_ids.contains(id))
+            {
+                return Ok(BatchTransform::PassThrough);
+            }
+        }
+
         let mapped_unprojected_arrow_schema = Arc::new(schema_to_arrow_schema(snapshot_schema)?);
         let field_id_to_mapped_schema_map =
             Self::build_field_id_to_arrow_schema_map(&mapped_unprojected_arrow_schema)?;
@@ -566,6 +587,28 @@ impl RecordBatchTransformer {
                 Ok(column_source)
             })
             .collect()
+    }
+
+    /// Walks `field` and every nested struct child, inserting each field id
+    /// it sees into `ids`. Used to detect dotted-path projections where a
+    /// nested field id has already been materialised inside an enclosing
+    /// struct by the parquet projection mask.
+    fn collect_field_ids(field: &FieldRef, ids: &mut HashSet<i32>) -> Result<()> {
+        if let Some(field_id_str) = field.metadata().get(PARQUET_FIELD_ID_META_KEY) {
+            let field_id: i32 = field_id_str.parse().map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("field id not parseable as an i32: {e}"),
+                )
+            })?;
+            ids.insert(field_id);
+        }
+        if let DataType::Struct(children) = field.data_type() {
+            for child in children {
+                Self::collect_field_ids(child, ids)?;
+            }
+        }
+        Ok(())
     }
 
     fn build_field_id_to_arrow_schema_map(
