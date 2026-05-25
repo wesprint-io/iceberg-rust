@@ -322,7 +322,7 @@ impl FileScanTaskReader {
                     &field_id_map,
                     &task.schema,
                 )?;
-                log::debug!(
+                log::trace!(
                     target: "iceberg::reader::prune",
                     "stats pruning: kept {kept} of {total} row groups (file: {file})",
                     kept = predicate_filtered_row_groups.len(),

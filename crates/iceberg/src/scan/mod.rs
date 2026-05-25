@@ -24,6 +24,7 @@ use context::*;
 mod task;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow_array::RecordBatch;
 use futures::channel::mpsc::{Sender, channel};
@@ -354,6 +355,52 @@ pub struct TableScan {
     row_selection_enabled: bool,
 }
 
+/// Aggregate counters for one `plan_files` invocation. Each
+/// `process_data_manifest_entry` call bumps exactly one of these atomics
+/// so the dispatch task can emit a single summary log when the stream
+/// finishes — avoiding the per-file noise of debug-logging each drop.
+#[derive(Debug, Default)]
+struct DataFileScanMetrics {
+    /// Data-file manifest entries marked deleted in the manifest itself.
+    /// These short-circuit before any predicate is evaluated.
+    deleted: AtomicU64,
+    /// Live data files that reached predicate evaluation. The sum of
+    /// `dropped_by_partition_predicate`, `dropped_by_file_stats`, and
+    /// `kept` equals this count.
+    considered: AtomicU64,
+    /// Live data files eliminated by the partition-data predicate
+    /// (`expression_evaluator.eval` against partition values).
+    dropped_by_partition_predicate: AtomicU64,
+    /// Live data files eliminated by file-level metrics (min/max,
+    /// null counts, etc.) via `InclusiveMetricsEvaluator`.
+    dropped_by_file_stats: AtomicU64,
+    /// Files that survived every prune step and were emitted as
+    /// [`FileScanTask`]s.
+    kept: AtomicU64,
+}
+
+impl DataFileScanMetrics {
+    fn log_summary(&self) {
+        let considered = self.considered.load(Ordering::Relaxed);
+        let deleted = self.deleted.load(Ordering::Relaxed);
+        // Skip the log when no work happened — common for scans of empty
+        // tables, scans cancelled early, or unit tests that never push
+        // any manifest entries through.
+        if considered == 0 && deleted == 0 {
+            return;
+        }
+        log::debug!(
+            target: "iceberg::scan::prune",
+            "data-file scan pruning summary: considered={considered} kept={kept} dropped_by_partition={partition} dropped_by_file_stats={stats} skipped_deleted={deleted}",
+            considered = considered,
+            kept = self.kept.load(Ordering::Relaxed),
+            partition = self.dropped_by_partition_predicate.load(Ordering::Relaxed),
+            stats = self.dropped_by_file_stats.load(Ordering::Relaxed),
+            deleted = deleted,
+        );
+    }
+}
+
 impl TableScan {
     /// Returns a stream of [`FileScanTask`]s.
     pub async fn plan_files(&self) -> Result<FileScanTaskStream> {
@@ -405,6 +452,12 @@ impl TableScan {
         let mut channel_for_data_manifest_entry_error = file_scan_task_tx.clone();
         let mut channel_for_delete_manifest_entry_error = file_scan_task_tx.clone();
 
+        // Aggregate pruning counters for the data-file stream. Each
+        // `process_data_manifest_entry` increments one of these so the
+        // dispatcher below can emit a single summary log line when the
+        // stream finishes, instead of one line per data file.
+        let scan_metrics = Arc::new(DataFileScanMetrics::default());
+
         // Process the delete file [`ManifestEntry`] stream in parallel
         spawn(async move {
             let result = manifest_entry_delete_ctx_rx
@@ -429,19 +482,33 @@ impl TableScan {
         .await;
 
         // Process the data file [`ManifestEntry`] stream in parallel
+        let scan_metrics_for_dispatch = scan_metrics.clone();
         spawn(async move {
             let result = manifest_entry_data_ctx_rx
-                .map(|me_ctx| Ok((me_ctx, file_scan_task_tx.clone())))
+                .map(|me_ctx| {
+                    Ok((
+                        me_ctx,
+                        file_scan_task_tx.clone(),
+                        scan_metrics_for_dispatch.clone(),
+                    ))
+                })
                 .try_for_each_concurrent(
                     concurrency_limit_manifest_entries,
-                    |(manifest_entry_context, tx)| async move {
+                    |(manifest_entry_context, tx, metrics)| async move {
                         spawn(async move {
-                            Self::process_data_manifest_entry(manifest_entry_context, tx).await
+                            Self::process_data_manifest_entry(
+                                manifest_entry_context,
+                                tx,
+                                metrics,
+                            )
+                            .await
                         })
                         .await
                     },
                 )
                 .await;
+
+            scan_metrics_for_dispatch.log_summary();
 
             if let Err(error) = result {
                 let _ = channel_for_data_manifest_entry_error.send(Err(error)).await;
@@ -481,11 +548,14 @@ impl TableScan {
     async fn process_data_manifest_entry(
         manifest_entry_context: ManifestEntryContext,
         mut file_scan_task_tx: Sender<Result<FileScanTask>>,
+        metrics: Arc<DataFileScanMetrics>,
     ) -> Result<()> {
         // skip processing this manifest entry if it has been marked as deleted
         if !manifest_entry_context.manifest_entry.is_alive() {
+            metrics.deleted.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
+        metrics.considered.fetch_add(1, Ordering::Relaxed);
 
         // abort the plan if we encounter a manifest entry for a delete file
         if manifest_entry_context.manifest_entry.content_type() != DataContentType::Data {
@@ -512,7 +582,10 @@ impl TableScan {
             // skip any data file whose partition data indicates that it can't contain
             // any data that matches this scan's filter
             if !expression_evaluator.eval(manifest_entry_context.manifest_entry.data_file())? {
-                log::debug!(
+                metrics
+                    .dropped_by_partition_predicate
+                    .fetch_add(1, Ordering::Relaxed);
+                log::trace!(
                     target: "iceberg::scan::prune",
                     "dropped by partition predicate (file: {file})",
                     file = manifest_entry_context.manifest_entry.file_path(),
@@ -526,7 +599,10 @@ impl TableScan {
                 manifest_entry_context.manifest_entry.data_file(),
                 false,
             )? {
-                log::debug!(
+                metrics
+                    .dropped_by_file_stats
+                    .fetch_add(1, Ordering::Relaxed);
+                log::trace!(
                     target: "iceberg::scan::prune",
                     "dropped by file-stats predicate (file: {file})",
                     file = manifest_entry_context.manifest_entry.file_path(),
@@ -538,11 +614,7 @@ impl TableScan {
         // congratulations! the manifest entry has made its way through the
         // entire plan without getting filtered out. Create a corresponding
         // FileScanTask and push it to the result stream
-        log::trace!(
-            target: "iceberg::scan::prune",
-            "kept (file: {file})",
-            file = manifest_entry_context.manifest_entry.file_path(),
-        );
+        metrics.kept.fetch_add(1, Ordering::Relaxed);
         file_scan_task_tx
             .send(Ok(manifest_entry_context.into_file_scan_task().await?))
             .await?;
