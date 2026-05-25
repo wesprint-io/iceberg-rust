@@ -315,12 +315,20 @@ impl FileScanTaskReader {
             record_batch_stream_builder = record_batch_stream_builder.with_row_filter(row_filter);
 
             if self.row_group_filtering_enabled {
+                let total_row_groups = record_batch_stream_builder.metadata().num_row_groups();
                 let predicate_filtered_row_groups = ArrowReader::get_selected_row_group_indices(
                     &predicate,
                     record_batch_stream_builder.metadata(),
                     &field_id_map,
                     &task.schema,
                 )?;
+                log::debug!(
+                    target: "iceberg::reader::prune",
+                    "stats pruning: kept {kept} of {total} row groups (file: {file})",
+                    kept = predicate_filtered_row_groups.len(),
+                    total = total_row_groups,
+                    file = task.data_file_path,
+                );
 
                 // Merge predicate-based filtering with byte range filtering (if present)
                 // by taking the intersection of both filters
@@ -341,15 +349,23 @@ impl FileScanTaskReader {
                 // predicates. Only loads bloom filters for columns the
                 // predicate actually targets.
                 if let Some(candidates) = selected_row_group_indices.clone() {
-                    selected_row_group_indices = Some(
-                        ArrowReader::prune_row_groups_with_bloom_filters(
-                            &predicate,
-                            &mut record_batch_stream_builder,
-                            &field_id_map,
-                            candidates,
-                        )
-                        .await?,
+                    let before = candidates.len();
+                    let survivors = ArrowReader::prune_row_groups_with_bloom_filters(
+                        &predicate,
+                        &mut record_batch_stream_builder,
+                        &field_id_map,
+                        candidates,
+                    )
+                    .await?;
+                    log::debug!(
+                        target: "iceberg::reader::prune",
+                        "bloom pruning: kept {kept} of {before} candidate row groups ({total} total in file: {file})",
+                        kept = survivors.len(),
+                        before = before,
+                        total = total_row_groups,
+                        file = task.data_file_path,
                     );
+                    selected_row_group_indices = Some(survivors);
                 }
             }
 

@@ -512,6 +512,11 @@ impl TableScan {
             // skip any data file whose partition data indicates that it can't contain
             // any data that matches this scan's filter
             if !expression_evaluator.eval(manifest_entry_context.manifest_entry.data_file())? {
+                log::debug!(
+                    target: "iceberg::scan::prune",
+                    "dropped by partition predicate (file: {file})",
+                    file = manifest_entry_context.manifest_entry.file_path(),
+                );
                 return Ok(());
             }
 
@@ -521,6 +526,11 @@ impl TableScan {
                 manifest_entry_context.manifest_entry.data_file(),
                 false,
             )? {
+                log::debug!(
+                    target: "iceberg::scan::prune",
+                    "dropped by file-stats predicate (file: {file})",
+                    file = manifest_entry_context.manifest_entry.file_path(),
+                );
                 return Ok(());
             }
         }
@@ -528,6 +538,11 @@ impl TableScan {
         // congratulations! the manifest entry has made its way through the
         // entire plan without getting filtered out. Create a corresponding
         // FileScanTask and push it to the result stream
+        log::trace!(
+            target: "iceberg::scan::prune",
+            "kept (file: {file})",
+            file = manifest_entry_context.manifest_entry.file_path(),
+        );
         file_scan_task_tx
             .send(Ok(manifest_entry_context.into_file_scan_task().await?))
             .await?;
