@@ -358,7 +358,7 @@ impl RecordBatchTransformer {
         // output — pass it through unchanged. The full target-schema
         // construction below only indexes top-level arrow fields by id and
         // would raise `field not found` on a nested id.
-        if constant_fields.is_empty() {
+        if !projected_iceberg_field_ids.is_empty() && constant_fields.is_empty() {
             let mut source_ids = HashSet::new();
             for field in source_schema.fields().iter() {
                 Self::collect_field_ids(field, &mut source_ids)?;
