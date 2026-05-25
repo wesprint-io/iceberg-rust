@@ -124,7 +124,7 @@ impl TableProvider for IcebergTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
@@ -136,6 +136,8 @@ impl TableProvider for IcebergTableProvider {
             .await
             .map_err(to_datafusion_error)?;
 
+        let config_options = Arc::new(state.config_options().clone());
+
         // Create scan with fresh metadata (always use current snapshot)
         Ok(Arc::new(
             IcebergTableScan::try_new(
@@ -145,6 +147,7 @@ impl TableProvider for IcebergTableProvider {
                 projection,
                 filters,
                 limit,
+                config_options,
             )
             .await?,
         ))
@@ -312,11 +315,13 @@ impl TableProvider for IcebergStaticTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let config_options = Arc::new(state.config_options().clone());
+
         // Use cached table (no refresh)
         Ok(Arc::new(
             IcebergTableScan::try_new(
@@ -326,6 +331,7 @@ impl TableProvider for IcebergStaticTableProvider {
                 projection,
                 filters,
                 limit,
+                config_options,
             )
             .await?,
         ))

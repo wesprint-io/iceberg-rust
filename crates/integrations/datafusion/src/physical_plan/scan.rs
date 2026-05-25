@@ -21,6 +21,7 @@ use std::vec;
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use datafusion::common::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -35,6 +36,7 @@ use iceberg::scan::FileScanTask;
 use iceberg::table::Table;
 
 use super::expr_to_predicate::convert_filters_to_predicate;
+use super::read_sort_order::translate_sort_order;
 use crate::to_datafusion_error;
 
 /// Manages the scanning process of an Iceberg [`Table`], encapsulating the
@@ -83,6 +85,7 @@ impl IcebergTableScan {
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
+        config_options: Arc<ConfigOptions>,
     ) -> DFResult<Self> {
         let output_schema = match projection {
             None => schema.clone(),
@@ -94,7 +97,12 @@ impl IcebergTableScan {
         let file_scan_tasks =
             plan_files(&table, snapshot_id, column_names.clone(), predicates.clone()).await?;
 
-        let plan_properties = Self::compute_properties(output_schema, file_scan_tasks.len());
+        let plan_properties = Self::compute_properties(
+            &table,
+            output_schema,
+            file_scan_tasks.len(),
+            config_options,
+        );
 
         Ok(Self {
             table,
@@ -136,12 +144,30 @@ impl IcebergTableScan {
     /// `n_files` is the number of [`FileScanTask`]s the planner produced;
     /// it determines how many partitions we expose. An empty file set
     /// still claims a single partition so `execute(0)` is always valid.
-    fn compute_properties(schema: ArrowSchemaRef, n_files: usize) -> Arc<PlanProperties> {
+    ///
+    /// `EquivalenceProperties` is populated with the lex ordering derived
+    /// from the table's `default_sort_order` (mapped through the projected
+    /// arrow schema). Files written by a conforming iceberg writer share
+    /// this ordering, so it applies per output partition — exactly the
+    /// shape `SortPreservingMergeExec` expects.
+    fn compute_properties(
+        table: &Table,
+        schema: ArrowSchemaRef,
+        n_files: usize,
+        config_options: Arc<ConfigOptions>,
+    ) -> Arc<PlanProperties> {
         let partitions = n_files.max(1);
+        let mut eq = EquivalenceProperties::new(schema.clone());
+        if let Some(lex) = translate_sort_order(
+            table.metadata().default_sort_order(),
+            table.metadata().current_schema(),
+            schema.as_ref(),
+            config_options,
+        ) {
+            eq.add_ordering(lex);
+        }
         Arc::new(PlanProperties::new(
-            // TODO: declare lex ordering from default_sort_order and
-            // partition-column constants from predicates.
-            EquivalenceProperties::new(schema),
+            eq,
             Partitioning::UnknownPartitioning(partitions),
             EmissionType::Incremental,
             Boundedness::Bounded,
