@@ -34,6 +34,7 @@ use super::{
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::int96::coerce_int96_timestamps;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
+use crate::arrow::timestamp_tz::coerce_timestamp_tz;
 use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
 use crate::error::Result;
 use crate::io::{FileIO, FileMetadata, FileRead};
@@ -192,6 +193,33 @@ impl FileScanTaskReader {
                         ErrorKind::Unexpected,
                         format!(
                             "Failed to create ArrowReaderMetadata with INT96-coerced schema: {coerced_schema}"
+                        ),
+                    )
+                    .with_source(e)
+                },
+            )?
+        } else {
+            arrow_metadata
+        };
+
+        // Normalize Timestamp timezones (e.g. arrow-rs's "UTC") to the Iceberg-canonical
+        // form ("+00:00") so batches the parquet reader emits match what
+        // `IcebergStaticTableProvider::schema()` and `schema_to_arrow_schema` report.
+        // Without this, downstream consumers (e.g. DataFusion's runtime batch validation)
+        // see semantically-identical-but-textually-different timezones and reject the
+        // batch — most visibly via the PassThrough short-circuit in
+        // `RecordBatchTransformer` on nested-field projections, which forwards the
+        // parquet reader's schema unchanged.
+        let arrow_metadata = if let Some(coerced_schema) =
+            coerce_timestamp_tz(arrow_metadata.schema(), &task.schema)
+        {
+            let options = ArrowReaderOptions::new().with_schema(Arc::clone(&coerced_schema));
+            ArrowReaderMetadata::try_new(Arc::clone(arrow_metadata.metadata()), options).map_err(
+                |e| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        format!(
+                            "Failed to create ArrowReaderMetadata with tz-coerced schema: {coerced_schema}"
                         ),
                     )
                     .with_source(e)
