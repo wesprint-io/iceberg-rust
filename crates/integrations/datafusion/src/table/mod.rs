@@ -137,17 +137,14 @@ impl TableProvider for IcebergTableProvider {
             .map_err(to_datafusion_error)?;
 
         // Create scan with fresh metadata (always use current snapshot)
-        Ok(Arc::new(
-            IcebergTableScan::try_new(
-                table,
-                None, // Always use current snapshot for catalog-backed provider
-                self.schema.clone(),
-                projection,
-                filters,
-                limit,
-            )
-            .await?,
-        ))
+        Ok(Arc::new(IcebergTableScan::new(
+            table,
+            None, // Always use current snapshot for catalog-backed provider
+            self.schema.clone(),
+            projection,
+            filters,
+            limit,
+        )))
     }
 
     fn supports_filters_pushdown(
@@ -318,17 +315,14 @@ impl TableProvider for IcebergStaticTableProvider {
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         // Use cached table (no refresh)
-        Ok(Arc::new(
-            IcebergTableScan::try_new(
-                self.table.clone(),
-                self.snapshot_id,
-                self.schema.clone(),
-                projection,
-                filters,
-                limit,
-            )
-            .await?,
-        ))
+        Ok(Arc::new(IcebergTableScan::new(
+            self.table.clone(),
+            self.snapshot_id,
+            self.schema.clone(),
+            projection,
+            filters,
+            limit,
+        )))
     }
 
     fn supports_filters_pushdown(
@@ -385,20 +379,6 @@ mod tests {
                 .await
                 .unwrap();
         static_table.into_table()
-    }
-
-    /// Returns a real (empty, snapshotless) [`Table`] backed by a temp-dir
-    /// memory catalog. Use this for tests that want to drive the static
-    /// provider's `scan()` path — the metadata-file fixture
-    /// (`get_test_table_from_metadata_file`) references s3 manifests that
-    /// don't exist, which used to be tolerated because file planning was
-    /// lazy. With eager planning we need a table whose manifest list is
-    /// actually readable (or empty).
-    async fn get_real_test_table() -> (Table, TempDir) {
-        let (catalog, namespace, table_name, temp_dir) = get_test_catalog_and_table().await;
-        let table_ident = TableIdent::new(namespace, table_name);
-        let table = catalog.load_table(&table_ident).await.unwrap();
-        (table, temp_dir)
     }
 
     async fn get_test_catalog_and_table() -> (Arc<dyn Catalog>, NamespaceIdent, String, TempDir) {
@@ -525,9 +505,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_static_provider_scan() {
-        // Use a real (empty) table so eager file planning has a valid
-        // manifest list to read.
-        let (table, _temp_dir) = get_real_test_table().await;
+        let table = get_test_table_from_metadata_file().await;
         let table_provider = IcebergStaticTableProvider::try_new_from_table(table.clone())
             .await
             .unwrap();
@@ -800,8 +778,7 @@ mod tests {
     async fn test_limit_pushdown_static_provider() {
         use datafusion::datasource::TableProvider;
 
-        // Eager file planning requires a readable manifest list.
-        let (table, _temp_dir) = get_real_test_table().await;
+        let table = get_test_table_from_metadata_file().await;
         let table_provider = IcebergStaticTableProvider::try_new_from_table(table.clone())
             .await
             .unwrap();
@@ -864,8 +841,7 @@ mod tests {
     async fn test_no_limit_pushdown() {
         use datafusion::datasource::TableProvider;
 
-        // Eager file planning requires a readable manifest list.
-        let (table, _temp_dir) = get_real_test_table().await;
+        let table = get_test_table_from_metadata_file().await;
         let table_provider = IcebergStaticTableProvider::try_new_from_table(table.clone())
             .await
             .unwrap();

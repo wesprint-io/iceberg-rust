@@ -16,6 +16,7 @@
 // under the License.
 
 use std::any::Any;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::vec;
 
@@ -29,9 +30,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use datafusion::prelude::Expr;
 use futures::{Stream, TryStreamExt};
-use iceberg::arrow::ArrowReaderBuilder;
 use iceberg::expr::Predicate;
-use iceberg::scan::FileScanTask;
 use iceberg::table::Table;
 
 use super::expr_to_predicate::convert_filters_to_predicate;
@@ -39,12 +38,6 @@ use crate::to_datafusion_error;
 
 /// Manages the scanning process of an Iceberg [`Table`], encapsulating the
 /// necessary details and computed properties required for execution planning.
-///
-/// Each [`FileScanTask`] is exposed as its own DataFusion partition. This
-/// preserves the per-file intrinsic ordering that conforming writers produce
-/// (per the table's `write.sort.order`), letting downstream planner rules
-/// like `EnforceSorting` insert `SortPreservingMergeExec` instead of forcing
-/// a global sort.
 #[derive(Debug)]
 pub struct IcebergTableScan {
     /// A table in the catalog.
@@ -58,53 +51,36 @@ pub struct IcebergTableScan {
     projection: Option<Vec<String>>,
     /// Filters to apply to the table scan
     predicates: Option<Predicate>,
-    /// Optional limit on the number of rows to return. Today this is honored
-    /// only when there is a single output partition; with multiple partitions
-    /// we leave the limit to a wrapping DataFusion `LimitExec`, which is
-    /// correct across the merged output.
+    /// Optional limit on the number of rows to return
     limit: Option<usize>,
-    /// One [`FileScanTask`] per output partition. Computed eagerly in
-    /// [`Self::try_new`] so partition count and ordering can be declared
-    /// on `plan_properties`.
-    file_scan_tasks: Arc<[FileScanTask]>,
 }
 
 impl IcebergTableScan {
-    /// Creates a new [`IcebergTableScan`] object by eagerly planning the
-    /// underlying file scan against `table`.
-    ///
-    /// The set of [`FileScanTask`]s is fixed at construction time so the
-    /// resulting plan can declare its partition count (one DataFusion
-    /// partition per file) to downstream optimizer rules.
-    pub(crate) async fn try_new(
+    /// Creates a new [`IcebergTableScan`] object.
+    pub(crate) fn new(
         table: Table,
         snapshot_id: Option<i64>,
         schema: ArrowSchemaRef,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
-    ) -> DFResult<Self> {
+    ) -> Self {
         let output_schema = match projection {
             None => schema.clone(),
             Some(projection) => Arc::new(schema.project(projection).unwrap()),
         };
-        let column_names = get_column_names(schema.clone(), projection);
+        let plan_properties = Self::compute_properties(output_schema.clone());
+        let projection = get_column_names(schema.clone(), projection);
         let predicates = convert_filters_to_predicate(filters);
 
-        let file_scan_tasks =
-            plan_files(&table, snapshot_id, column_names.clone(), predicates.clone()).await?;
-
-        let plan_properties = Self::compute_properties(output_schema, file_scan_tasks.len());
-
-        Ok(Self {
+        Self {
             table,
             snapshot_id,
             plan_properties,
-            projection: column_names,
+            projection,
             predicates,
             limit,
-            file_scan_tasks,
-        })
+        }
     }
 
     pub fn table(&self) -> &Table {
@@ -127,22 +103,14 @@ impl IcebergTableScan {
         self.limit
     }
 
-    pub fn file_scan_tasks(&self) -> &[FileScanTask] {
-        &self.file_scan_tasks
-    }
-
     /// Computes [`PlanProperties`] used in query optimization.
-    ///
-    /// `n_files` is the number of [`FileScanTask`]s the planner produced;
-    /// it determines how many partitions we expose. An empty file set
-    /// still claims a single partition so `execute(0)` is always valid.
-    fn compute_properties(schema: ArrowSchemaRef, n_files: usize) -> Arc<PlanProperties> {
-        let partitions = n_files.max(1);
+    fn compute_properties(schema: ArrowSchemaRef) -> Arc<PlanProperties> {
+        // TODO:
+        // This is more or less a placeholder, to be replaced
+        // once we support output-partitioning
         Arc::new(PlanProperties::new(
-            // TODO: declare lex ordering from default_sort_order and
-            // partition-column constants from predicates.
             EquivalenceProperties::new(schema),
-            Partitioning::UnknownPartitioning(partitions),
+            Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
         ))
@@ -175,34 +143,21 @@ impl ExecutionPlan for IcebergTableScan {
 
     fn execute(
         &self,
-        partition: usize,
+        _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        // Empty scan: one virtual partition, zero rows.
-        if self.file_scan_tasks.is_empty() {
-            if partition != 0 {
-                return Err(datafusion::error::DataFusionError::Execution(format!(
-                    "IcebergTableScan: requested partition {partition} but scan is empty"
-                )));
-            }
-            return Ok(Box::pin(RecordBatchStreamAdapter::new(
-                self.schema(),
-                futures::stream::empty(),
-            )));
-        }
-
-        let task = self.file_scan_tasks[partition].clone();
-        let file_io = self.table.file_io().clone();
-        let fut = stream_one_file(file_io, task);
+        let fut = get_batch_stream(
+            self.table.clone(),
+            self.snapshot_id,
+            self.projection.clone(),
+            self.predicates.clone(),
+        );
         let stream = futures::stream::once(fut).try_flatten();
 
-        // Apply limit only when there's a single partition. With multiple
-        // partitions a per-partition row count is the wrong shape for a
-        // table-level limit, so we leave it to the DataFusion planner to
-        // insert a `LimitExec` above the merge.
-        let stream: futures::stream::BoxStream<'static, DFResult<RecordBatch>> =
-            if self.file_scan_tasks.len() == 1 && self.limit.is_some() {
-                let mut remaining = self.limit.unwrap();
+        // Apply limit if specified
+        let limited_stream: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
+            if let Some(limit) = self.limit {
+                let mut remaining = limit;
                 Box::pin(stream.try_filter_map(move |batch| {
                     futures::future::ready(if remaining == 0 {
                         Ok(None)
@@ -210,9 +165,9 @@ impl ExecutionPlan for IcebergTableScan {
                         remaining -= batch.num_rows();
                         Ok(Some(batch))
                     } else {
-                        let limited = batch.slice(0, remaining);
+                        let limited_batch = batch.slice(0, remaining);
                         remaining = 0;
-                        Ok(Some(limited))
+                        Ok(Some(limited_batch))
                     })
                 }))
             } else {
@@ -221,7 +176,7 @@ impl ExecutionPlan for IcebergTableScan {
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
-            stream,
+            limited_stream,
         )))
     }
 }
@@ -249,15 +204,17 @@ impl DisplayAs for IcebergTableScan {
     }
 }
 
-/// Run iceberg's file planner once and materialise the surviving
-/// [`FileScanTask`]s. Done eagerly in [`IcebergTableScan::try_new`] so
-/// we know the partition count before computing `PlanProperties`.
-async fn plan_files(
-    table: &Table,
+/// Asynchronously retrieves a stream of [`RecordBatch`] instances
+/// from a given table.
+///
+/// This function initializes a [`TableScan`], builds it,
+/// and then converts it into a stream of Arrow [`RecordBatch`]es.
+async fn get_batch_stream(
+    table: Table,
     snapshot_id: Option<i64>,
     column_names: Option<Vec<String>>,
     predicates: Option<Predicate>,
-) -> DFResult<Arc<[FileScanTask]>> {
+) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
     let scan_builder = match snapshot_id {
         Some(snapshot_id) => table.scan().snapshot_id(snapshot_id),
         None => table.scan(),
@@ -272,27 +229,12 @@ async fn plan_files(
     }
     let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
 
-    let file_stream = table_scan
-        .plan_files()
+    let stream = table_scan
+        .to_arrow()
         .await
-        .map_err(to_datafusion_error)?;
-    let tasks: Vec<FileScanTask> = file_stream
-        .try_collect()
-        .await
-        .map_err(to_datafusion_error)?;
-    Ok(tasks.into())
-}
-
-/// Open one [`FileScanTask`] and adapt its row stream into a DataFusion
-/// error type. Preserves the file's intrinsic ordering (the table's
-/// `write.sort.order` applied to this file's contents).
-async fn stream_one_file(
-    file_io: iceberg::io::FileIO,
-    task: FileScanTask,
-) -> DFResult<impl Stream<Item = DFResult<RecordBatch>> + Send> {
-    let reader = ArrowReaderBuilder::new(file_io).build();
-    let stream = reader.stream_file(task).await.map_err(to_datafusion_error)?;
-    Ok(stream.map_err(to_datafusion_error))
+        .map_err(to_datafusion_error)?
+        .map_err(to_datafusion_error);
+    Ok(Box::pin(stream))
 }
 
 fn get_column_names(
