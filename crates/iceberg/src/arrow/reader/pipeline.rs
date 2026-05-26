@@ -88,6 +88,39 @@ impl ArrowReader {
 
         Ok(ScanResult::new(stream, scan_metrics))
     }
+
+    /// Open one [`FileScanTask`] and return its row stream, preserving
+    /// the file's intrinsic ordering.
+    ///
+    /// Unlike [`Self::read`] — which fans out across multiple files
+    /// concurrently and interleaves them through `try_buffer_unordered` —
+    /// this method opens exactly one parquet object and emits rows in
+    /// the order the parquet reader produces them. For files written
+    /// by a conforming Iceberg writer, that order is the table's
+    /// `write.sort.order` applied to this file's contents.
+    ///
+    /// Use it when downstream code wants per-file streams as merge
+    /// inputs — e.g. driving a sort-preserving merge across files that
+    /// are individually sorted but not globally sorted as a set.
+    ///
+    /// Scan metrics are tracked internally for this call but are not
+    /// returned; if you need them, drive [`Self::read`] over a one-item
+    /// stream instead.
+    pub async fn stream_file(self, task: FileScanTask) -> Result<ArrowRecordBatchStream> {
+        let scan_metrics = ScanMetrics::new();
+        let task_reader = FileScanTaskReader {
+            batch_size: self.batch_size,
+            file_io: self.file_io,
+            delete_file_loader: self
+                .delete_file_loader
+                .with_scan_metrics(scan_metrics.clone()),
+            row_group_filtering_enabled: self.row_group_filtering_enabled,
+            row_selection_enabled: self.row_selection_enabled,
+            parquet_read_options: self.parquet_read_options,
+            scan_metrics,
+        };
+        task_reader.process(task).await
+    }
 }
 
 /// Per-scan state for processing [`FileScanTask`]s. Created once per
@@ -872,6 +905,100 @@ mod tests {
             assert_eq!(all_file_nums[i], 2, "Last 10 rows should be from file_2");
             assert_eq!(all_ids[i], i as i32, "IDs should be 20-29");
         }
+    }
+
+    #[tokio::test]
+    async fn test_stream_file_matches_read_single_task() {
+        use arrow_array::Int32Array;
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )
+        .with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "1".to_string(),
+        )]))]));
+
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().to_str().unwrap().to_string();
+        let file_io = FileIO::new_with_fs();
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+
+        let id_data = Arc::new(Int32Array::from_iter_values(0..50)) as ArrayRef;
+        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![id_data]).unwrap();
+        let file = File::create(format!("{table_location}/file.parquet")).unwrap();
+        let mut writer =
+            ArrowWriter::try_new(file, to_write.schema(), Some(props.clone())).unwrap();
+        writer.write(&to_write).expect("Writing batch");
+        writer.close().unwrap();
+
+        let make_task = || FileScanTask {
+            file_size_in_bytes: std::fs::metadata(format!("{table_location}/file.parquet"))
+                .unwrap()
+                .len(),
+            start: 0,
+            length: 0,
+            record_count: None,
+            data_file_path: format!("{table_location}/file.parquet"),
+            data_file_format: DataFileFormat::Parquet,
+            schema: schema.clone(),
+            project_field_ids: vec![1],
+            predicate: None,
+            deletes: vec![],
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: false,
+        };
+
+        // Baseline: read via the streaming entry point with a one-task stream.
+        let reader = ArrowReaderBuilder::new(file_io.clone())
+            .with_data_file_concurrency_limit(1)
+            .build();
+        let baseline: Vec<RecordBatch> = reader
+            .read(Box::pin(futures::stream::iter(vec![Ok(make_task())])))
+            .unwrap()
+            .stream()
+            .try_collect()
+            .await
+            .unwrap();
+
+        // Target: read the same file via the new per-task entry point.
+        let reader = ArrowReaderBuilder::new(file_io).build();
+        let stream = reader.stream_file(make_task()).await.unwrap();
+        let actual: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let baseline_rows: usize = baseline.iter().map(|b| b.num_rows()).sum();
+        let actual_rows: usize = actual.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(actual_rows, baseline_rows, "row counts must match");
+        assert_eq!(actual_rows, 50);
+
+        let actual_ids: Vec<i32> = actual
+            .iter()
+            .flat_map(|batch| {
+                let col = batch
+                    .column(0)
+                    .as_primitive::<arrow_array::types::Int32Type>();
+                (0..batch.num_rows())
+                    .map(|i| col.value(i))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(actual_ids, (0..50).collect::<Vec<_>>());
     }
 
     #[tokio::test]
