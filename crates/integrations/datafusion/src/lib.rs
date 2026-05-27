@@ -21,6 +21,7 @@ pub use catalog::*;
 mod error;
 pub use error::*;
 
+pub mod physical_optimizer;
 pub mod physical_plan;
 mod schema;
 pub mod table;

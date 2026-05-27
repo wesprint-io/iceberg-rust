@@ -91,8 +91,13 @@ impl IcebergTableScan {
         let column_names = get_column_names(schema.clone(), projection);
         let predicates = convert_filters_to_predicate(filters);
 
-        let file_scan_tasks =
-            plan_files(&table, snapshot_id, column_names.clone(), predicates.clone()).await?;
+        let file_scan_tasks = plan_files(
+            &table,
+            snapshot_id,
+            column_names.clone(),
+            predicates.clone(),
+        )
+        .await?;
 
         let plan_properties = Self::compute_properties(output_schema, file_scan_tasks.len());
 
@@ -129,6 +134,56 @@ impl IcebergTableScan {
 
     pub fn file_scan_tasks(&self) -> &[FileScanTask] {
         &self.file_scan_tasks
+    }
+
+    /// Returns a scan that reads only the given dotted nested paths from each
+    /// file. The current `FileScanTask`s are reused (their data-file set and
+    /// predicate are unchanged), but each task's `project_field_ids` is
+    /// replaced with the field ids resolved from `dotted_paths` against the
+    /// table's current schema. `narrowed_schema` becomes the declared output
+    /// schema of the rewritten scan and must match the arrow shape the iceberg
+    /// reader will produce for the requested paths (the enclosing struct path
+    /// is preserved; only the projected leaves remain inside).
+    ///
+    /// Used by [`crate::physical_optimizer::NestedFieldProjectionPushdown`] to
+    /// recover the nested projection that `TableProvider::scan` cannot carry.
+    pub(crate) fn with_nested_projection(
+        &self,
+        dotted_paths: Vec<String>,
+        narrowed_schema: ArrowSchemaRef,
+    ) -> DFResult<Self> {
+        let schema = self.table.metadata().current_schema();
+        let mut new_field_ids: Vec<i32> = Vec::with_capacity(dotted_paths.len());
+        for path in &dotted_paths {
+            let field_id = schema.field_id_by_name(path).ok_or_else(|| {
+                datafusion::error::DataFusionError::Plan(format!(
+                    "Column `{path}` not found in iceberg table schema"
+                ))
+            })?;
+            new_field_ids.push(field_id);
+        }
+
+        let new_tasks: Vec<FileScanTask> = self
+            .file_scan_tasks
+            .iter()
+            .map(|task| {
+                let mut next = task.clone();
+                next.project_field_ids = new_field_ids.clone();
+                next
+            })
+            .collect();
+
+        let plan_properties = Self::compute_properties(narrowed_schema, new_tasks.len());
+
+        Ok(Self {
+            table: self.table.clone(),
+            snapshot_id: self.snapshot_id,
+            plan_properties,
+            projection: Some(dotted_paths),
+            predicates: self.predicates.clone(),
+            limit: self.limit,
+            file_scan_tasks: new_tasks.into(),
+        })
     }
 
     /// Computes [`PlanProperties`] used in query optimization.
@@ -272,10 +327,7 @@ async fn plan_files(
     }
     let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
 
-    let file_stream = table_scan
-        .plan_files()
-        .await
-        .map_err(to_datafusion_error)?;
+    let file_stream = table_scan.plan_files().await.map_err(to_datafusion_error)?;
     let tasks: Vec<FileScanTask> = file_stream
         .try_collect()
         .await
@@ -291,7 +343,10 @@ async fn stream_one_file(
     task: FileScanTask,
 ) -> DFResult<impl Stream<Item = DFResult<RecordBatch>> + Send> {
     let reader = ArrowReaderBuilder::new(file_io).build();
-    let stream = reader.stream_file(task).await.map_err(to_datafusion_error)?;
+    let stream = reader
+        .stream_file(task)
+        .await
+        .map_err(to_datafusion_error)?;
     Ok(stream.map_err(to_datafusion_error))
 }
 
