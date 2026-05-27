@@ -247,6 +247,17 @@ impl ExecutionPlan for IcebergTableScan {
         }
 
         let task = self.file_scan_tasks[partition].clone();
+        log::debug!(
+            target: "iceberg::scan::read",
+            "reading file={file} columns={columns} field_ids={field_ids:?}",
+            file = task.data_file_path,
+            columns = self
+                .projection
+                .as_deref()
+                .map(|c| c.join(","))
+                .unwrap_or_else(|| "<all>".into()),
+            field_ids = task.project_field_ids,
+        );
         let file_io = self.table.file_io().clone();
         let fut = stream_one_file(file_io, task);
         let stream = futures::stream::once(fut).try_flatten();
