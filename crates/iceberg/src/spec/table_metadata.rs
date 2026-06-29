@@ -332,6 +332,18 @@ impl TableMetadata {
         })
     }
 
+    /// Returns all named snapshot references (branches and tags) keyed by name.
+    #[inline]
+    pub fn refs(&self) -> &HashMap<String, SnapshotReference> {
+        &self.refs
+    }
+
+    /// Returns the snapshot reference for `ref_name`, if it exists.
+    #[inline]
+    pub fn snapshot_ref(&self, ref_name: &str) -> Option<&SnapshotReference> {
+        self.refs.get(ref_name)
+    }
+
     /// Return all sort orders.
     #[inline]
     pub fn sort_orders_iter(&self) -> impl ExactSizeIterator<Item = &SortOrderRef> {
