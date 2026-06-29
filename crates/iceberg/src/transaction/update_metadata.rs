@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::spec::{Schema, SchemaId, UnboundPartitionSpec};
+use crate::spec::{Schema, SchemaId, SnapshotReference, UnboundPartitionSpec};
 use crate::table::Table;
 use crate::transaction::action::{ActionCommit, TransactionAction};
 use crate::{Error, ErrorKind, Result, TableRequirement, TableUpdate};
@@ -121,6 +121,25 @@ impl UpdateMetadataAction {
             self.updates
                 .push(TableUpdate::RemoveSnapshots { snapshot_ids });
         }
+        self
+    }
+
+    /// Sets a snapshot reference (branch or tag) to point at a snapshot.
+    ///
+    /// Creating a new ref and moving an existing one are both expressed as a
+    /// single [`TableUpdate::SetSnapshotRef`]. Pair with
+    /// [`Self::check_ref_snapshot_id`] for optimistic-concurrency control, for
+    /// example requiring that the ref does not yet exist (snapshot id `None`) or
+    /// still points where the caller last observed it.
+    pub fn set_snapshot_ref(
+        mut self,
+        ref_name: impl Into<String>,
+        reference: SnapshotReference,
+    ) -> Self {
+        self.updates.push(TableUpdate::SetSnapshotRef {
+            ref_name: ref_name.into(),
+            reference,
+        });
         self
     }
 }
